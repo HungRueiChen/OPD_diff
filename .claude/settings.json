@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//c/Users/ray00/AppData/Local/opd_diff/**)",
+      "Read(//c/Users/ray00/Documents/OPD_fixtures/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Bash|PowerShell|Artifact|SendUserFile|mcp__ide__executeCode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/c/Users/ray00/AppData/Local/Programs/Python/Python312/python.exe\" \"/c/Users/ray00/OneDrive/VSCode/OPD_diff/tools/phi_guard.py\"",
+            "timeout": 30,
+            "statusMessage": "Scanning for patient identifiers..."
+          }
+        ]
+      }
+    ]
+  }
+}

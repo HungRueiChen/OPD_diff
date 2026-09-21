@@ -1,0 +1,28 @@
+# De-identified twins are still derived from patient data. Never commit them.
+deid/
+
+# Raw HIS output written by the generator at runtime.
+prompt.txt
+Replied.html
+ProgressNote.pdf
+raw/
+
+__pycache__/
+*.pyc
+fixtures/
+example/
+
+# A separate cloned repo that happens to live in this folder. It carries its own
+# .git and a bundled chromedriver.exe; committing it would swallow a foreign
+# project into this history.
+Autogenerate-admission/
+
+# NOTE: extension/lib/ is deliberately NOT ignored, although it IS build output
+# from tools/build_extension.py.
+#
+# The extension is installed by copying the folder onto hospital workstations
+# that cannot run python or git, so extension/ has to be a complete, directly
+# loadable unpacked extension. Committing the copies is what makes that possible.
+#
+# src/ remains the single source of truth: edit there and re-run the build
+# script. Never edit extension/lib/ by hand -- the next build overwrites it.

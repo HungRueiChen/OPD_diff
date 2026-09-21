@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "OPD_diff",
+  "version": "0.1.0",
+  "description": "Compare a patient's outpatient notes across visits, and see what each visit newly wrote.",
+
+  "minimum_chrome_version": "109",
+
+  "permissions": ["storage"],
+
+  "host_permissions": [
+    "https://web9.vghtpe.gov.tw/*",
+    "https://rkeprd.vghtpe.gov.tw/*"
+  ],
+
+  "background": { "service_worker": "sw.js" },
+
+  "action": { "default_title": "OPD_diff — read the current patient" },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://web9.vghtpe.gov.tw/emr/qemr/*",
+        "https://rkeprd.vghtpe.gov.tw/emr/qemr/*"
+      ],
+      "js": [
+        "lib/opd_parse.js",
+        "lib/opd_lineage.js",
+        "lib/opd_course.js",
+        "lib/opd_view.js",
+        "lib/capture.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

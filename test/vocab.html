@@ -1,0 +1,174 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPD_diff vocabulary miner</title>
+<!--
+  Finds vocabulary the course classifier misses, over every de-identified fixture:
+      python tools/make_fixture_js.py
+      python test/run_vocab.py [--edge] [--min 2]
+
+  The premise: a line in O: or A: that carries clinical language but that
+  OPDCourse.classify() returns nothing for is, by definition, vocabulary we do not
+  have yet.
+
+  Two things this has to get right, both learned the hard way:
+
+  * Copy-forward makes raw frequency a lie. A line copied into forty notes is one
+    observation, not forty. Everything here counts DISTINCT PATIENTS, and within a
+    patient each distinct line counts once.
+  * ICD lines are not vocabulary. "C13.9 Malignant neoplasm of hypopharynx" is
+    already structured by OPDParse; counting it as a gap buries the real finds.
+
+  Nothing here decides anything. It ranks candidates for a clinician to accept or
+  reject; the vocabulary in opd_course.js should be theirs, not mine.
+-->
+<style>body{font:13px/1.5 ui-monospace,Consolas,monospace;margin:0;padding:12px}</style>
+<pre id="out">running…</pre>
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script>
+(function () {
+  "use strict";
+  var out = document.getElementById("out");
+
+  // Already known to the classifier: matching these is not a gap.
+  var KNOWN = /\b(complete response|partial response|near complete|stable disease|progressive disease|progression|regression|recurrence|recurrent|no residual|residual tumou?r|no evidence of disease|NED|CR|PR|SD|PD|CT|PET|MRI|WBBS|bone scan|echo|EGD|panendoscopy|ultrasound|sonography|US|CXR|X-ray|scan|OP|operation|surgery|resection|dissection|biopsy|NACT|CCRT|RT|radiotherapy|irradiation|chemotherapy|chemo|CTx|immunotherapy|Gy|cGy|fx|fraction)\b/i;
+
+  // Structural scaffolding, not clinical language: CTCAE furniture, rules, headers.
+  //
+  // The earlier version matched only a CTCAE block's HEADER, so every wrapped
+  // continuation line -- "oral(G0);Nausea(G0);Palmar-plantar..." -- came through
+  // and drowned the candidate list. The reliable marker of a continuation is the
+  // grade notation "(G0)" / "(G-7)" itself, not the words around it. The weight
+  // -change template (體重為 X 及 Y 公斤，變化值為 N%) wraps the same way.
+  //
+  // Consequence worth knowing: this also removes mucositis / neuropathy /
+  // dermatitis from the candidates, because CTCAE blocks are where they live.
+  // That follows the rule that O: is exam findings first and toxicity second --
+  // if toxicity vocabulary is wanted too, tag these lines instead of dropping.
+  var BOILERPLATE = /副作用|評估|檢驗日|補充說明|治療日期|CTCAE|癌篩|體重為|變化值|\(G-?\d+\)|^\s*[-=*_]+\s*$|^\s*Dose\s*[:：]?\s*$|^\s*<[^>]*>\s*$/;
+
+  // Candidate terms. ALL-CAPS phrases catch the shouting style these notes use
+  // (FIBERSCOPY, CACHESIA, ILEUS); the lowercase list catches findings written in
+  // prose, which the caps-only pass could never see.
+  var CAPS_PHRASE = /\b[A-Z][A-Z0-9'\-]{2,}(?:\s+[A-Z][A-Z0-9'\-]{2,}){0,4}\b/g;
+  var LOWER_TERM = /\b(?:[a-z]+(?:opathy|ectomy|ostomy|otomy|itis|osis|emia|uria|algia|plasia|trophy|genic|matous))\b|\b(?:lymph\w+|metasta\w+|infiltrat\w+|effusion|ascites|nodule|lesion|mass|thickening|enhancing|necrosis|fistula|stricture|obstruct\w+|perforat\w+|cachexi\w+|ileus)\b/gi;
+  var STOP = /^(THE|AND|FOR|WITH|WITHOUT|THIS|THAT|WAS|HAS|HAVE|NOT|BUT|ALL|ANY|DUE|PER|VIA|OVER|FROM|INTO|JOB|END|OPD|TAB|CAP|INJ|PO|BID|TID|QD|PRN|MG|ML|KG|CM|MM|NOW|ALSO|STILL|BOTH|LEFT|RIGHT|YES|NO)$/;
+
+  function linesOf(text) {
+    return String(text || "").split("\n").map(function (l) { return l.trim(); })
+      .filter(function (l) { return l.length > 3; });
+  }
+
+  // Group variants of the same sentence: digits differ visit to visit, the words
+  // do not. "DEXA -4.5" and "DEXA -3.9" are one piece of vocabulary.
+  function normalise(line) {
+    return line.replace(/\d+(?:\.\d+)?/g, "#").replace(/\s+/g, " ").trim().toUpperCase();
+  }
+
+  function isDiagnosisLine(line) {
+    try {
+      return OPDParse.parseDiagnosisLine(line, false) !== null
+          || OPDParse.parseDiagnosisLine(line, true) !== null;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function bump(map, key, patient, example) {
+    var e = map[key] = map[key] || { patients: {}, notes: 0, example: example };
+    e.patients[patient] = true;
+    e.notes++;
+    return e;
+  }
+
+  function rank(map) {
+    return Object.keys(map).map(function (k) {
+      var e = map[k];
+      return { key: k, patients: Object.keys(e.patients).length, notes: e.notes, example: e.example };
+    }).sort(function (a, b) {
+      return (b.patients - a.patients) || (b.notes - a.notes) || a.key.localeCompare(b.key);
+    });
+  }
+
+  function run() {
+    var fixtures = window.OPD_FIXTURES;
+    if (!fixtures) throw new Error("window.OPD_FIXTURES missing -- run tools/make_fixture_js.py");
+    ["OPDParse", "OPDLineage", "OPDCourse"].forEach(function (mod) {
+      if (!window[mod]) throw new Error(mod + " missing -- its script did not load");
+    });
+
+    var lines = {}, terms = {};
+    var stats = { patients: 0, notes: 0, lines: 0, classified: 0, diagnosisLines: 0,
+                  gapLines: 0, distinctGapLines: 0 };
+
+    Object.keys(fixtures).forEach(function (name) {
+      stats.patients++;
+      var capture = fixtures[name];
+      var list = OPDParse.parseList(capture.list.html);
+      var byRow = new Map(list.visits.map(function (v) { return [v.rowIndex, v]; }));
+      var seenLine = {}, seenTerm = {};   // per patient: copy-forward counts once
+
+      capture.notes.forEach(function (raw) {
+        if (!byRow.has(raw.rowIndex)) return;
+        stats.notes++;
+        var note = OPDParse.parseNote(raw.html);
+        ["O", "A"].forEach(function (key) {
+          linesOf(OPDLineage.sectionText(note, key)).forEach(function (line) {
+            stats.lines++;
+            if (BOILERPLATE.test(line)) return;
+            if (isDiagnosisLine(line)) { stats.diagnosisLines++; return; }
+            if (OPDCourse.classify(line).length) { stats.classified++; return; }
+            stats.gapLines++;
+
+            var shown = line.length > 150 ? line.slice(0, 150) + "…" : line;
+            var norm = normalise(line);
+            if (!seenLine[norm]) { seenLine[norm] = true; bump(lines, norm, name, shown); }
+
+            var m, term;
+            CAPS_PHRASE.lastIndex = 0;
+            while ((m = CAPS_PHRASE.exec(line)) !== null) {
+              term = m[0].trim();
+              if (STOP.test(term) || KNOWN.test(term)) continue;
+              if (seenTerm[term]) continue;
+              seenTerm[term] = true;
+              bump(terms, term, name, shown);
+            }
+            LOWER_TERM.lastIndex = 0;
+            while ((m = LOWER_TERM.exec(line)) !== null) {
+              term = m[0].trim().toLowerCase();
+              if (KNOWN.test(term) || seenTerm[term]) continue;
+              seenTerm[term] = true;
+              bump(terms, term, name, shown);
+            }
+          });
+        });
+      });
+    });
+
+    var rankedLines = rank(lines);
+    var rankedTerms = rank(terms);
+    stats.distinctGapLines = rankedLines.length;
+    var min = parseInt(new URLSearchParams(location.search).get("min") || "1", 10);
+    var keep = function (r) { return r.patients >= min; };
+
+    return {
+      stats: stats,
+      note: "Counts are DISTINCT PATIENTS; a line copied forward within one patient "
+          + "counts once. Terms/lines seen in one patient are likely that attending's "
+          + "habit; those seen across many are ward vocabulary worth adding.",
+      candidateTerms: rankedTerms.filter(keep).slice(0, 60),
+      candidateLines: rankedLines.filter(keep).slice(0, 60),
+      belowThreshold: { terms: rankedTerms.length - rankedTerms.filter(keep).length,
+                        lines: rankedLines.length - rankedLines.filter(keep).length },
+    };
+  }
+
+  try {
+    out.textContent = JSON.stringify(run(), null, 1);
+  } catch (e) {
+    out.textContent = "VOCAB ERROR\n" + ((e && e.stack) || e);
+  }
+})();
+</script>

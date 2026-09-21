@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPD_diff parser harness</title>
+<!--
+  Offline harness. Loads de-identified fixtures and the shipping modules into a
+  real browser, runs every note through them, and prints a JSON report into #out.
+  Drive it headless with `--dump-dom` so the report comes back on stdout:
+      python tools/make_fixture_js.py
+      python test/run_harness.py [--edge]
+-->
+<pre id="out">harness did not run</pre>
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script src="harness.js"></script>

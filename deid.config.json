@@ -1,0 +1,16 @@
+{
+  "_comment": "Tuning for tools/deid.py. 'exclude' takes globs relative to the project root, or absolute forward-slash paths; matching files are neither scanned nor blocked. Use it only for confirmed false positives (library versions, article ids, accession numbers), never to silence a real identifier.",
+  "_comment_memory": "Claude's own memory directory is excluded: it must never hold patient data, it is loaded into context every session regardless of this guard, and its project notes carry counts that trip the date rules.",
+  "_comment_vendor": "Minified vendor CSS/JS carries long digit runs that the bare 7-8 digit chart sweep reads as chart numbers. These are library assets saved alongside a page, never clinical text.",
+  "exclude": [
+    "C:/Users/ray00/.claude/projects/*/memory/*",
+    "**/jquery*.css",
+    "**/jquery*.js",
+    "**/*_files/*.min.css",
+    "**/*_files/*.min.js"
+  ],
+  "_comment_raw_dirs": "Raw HIS captures live outside the project and outside OneDrive. Each entry maps a raw directory to the folder under deid/ where its de-identified twins are written.",
+  "raw_dirs": {
+    "C:/Users/ray00/Documents/OPD_fixtures": "fixtures"
+  }
+}

@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPD_diff view harness</title>
+<!--
+  Renders the real view over a de-identified fixture, so the page can be checked
+  in a real browser:
+      python tools/make_fixture_js.py
+      python test/run_view.py [--edge] [--mode compare|blame] [--select 46,47]
+  ?mode=  opens that tab; ?select= picks visits by index for a deterministic shot
+  (blame needs exactly one). Without ?select the view chooses its own default.
+-->
+<style>html,body{height:100%;margin:0}#app{height:100%}</style>
+<div id="app"></div>
+<pre id="status" hidden></pre>
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script src="../src/opd_view.js"></script>
+<script>
+(function () {
+  "use strict";
+  var status = document.getElementById("status");
+  try {
+    var params = new URLSearchParams(location.search);
+    var names = Object.keys(window.OPD_FIXTURES || {});
+    if (!names.length) throw new Error("no fixtures -- run tools/make_fixture_js.py");
+    var name = names[Math.min(names.length - 1, Math.max(0, parseInt(params.get("case") || "0", 10)))];
+    var capture = window.OPD_FIXTURES[name];
+
+    var list = OPDParse.parseList(capture.list.html);
+    var byRow = new Map(list.visits.map(function (v) { return [v.rowIndex, v]; }));
+    var entries = [];
+    capture.notes.forEach(function (raw) {
+      var visit = byRow.get(raw.rowIndex);
+      if (visit) entries.push({ visit: visit, note: OPDParse.parseNote(raw.html) });
+    });
+    var lineage = OPDLineage.build(entries);
+    var course = OPDCourse.build(lineage);
+
+    var view = OPDView.mount(document.getElementById("app"), {
+      caseName: name.replace(/^opd-capture-/, "case "),
+      entries: entries, lineage: lineage, course: course,
+    });
+
+    var select = params.get("select");
+    if (select) {
+      var keys = select.split(",")
+        .map(function (s) { return parseInt(s, 10); })
+        .filter(function (n) { return !isNaN(n) && n >= 0 && n < lineage.nodes.length; })
+        .map(function (n) { return lineage.nodes[n].visit.key; });
+      if (keys.length) view.select(keys);
+    }
+    var mode = params.get("mode");
+    // "course" is listed explicitly now that it is no longer the default mode:
+    // without it, --mode course would silently render Compare instead.
+    if (mode === "compare" || mode === "blame" || mode === "course") view.setMode(mode);
+
+    status.textContent = "VIEW OK " + entries.length + " visits, " + view.state.selected.size + " selected";
+  } catch (e) {
+    status.hidden = false;
+    status.textContent = "VIEW ERROR\n" + ((e && e.stack) || e);
+  }
+})();
+</script>

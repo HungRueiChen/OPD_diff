@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPD_diff</title>
+<!--
+  The full-tab surface. The overlay hands a capture over through
+  chrome.storage.local and asks the service worker to open this page.
+
+  No inline script: MV3 forbids it on extension pages, so everything lives in
+  viewer.js. The modules below are copies of src/*.js, written by
+  tools/build_extension.py -- edit src/, never extension/lib/.
+-->
+<style>
+  html, body { height: 100%; margin: 0; }
+  #app { height: 100%; }
+  #status {
+    font: 14px/1.6 system-ui, 'Segoe UI', 'Noto Sans TC', sans-serif;
+    color: #5b6672; padding: 28px; white-space: pre-wrap;
+  }
+</style>
+<div id="app"></div>
+<pre id="status" hidden></pre>
+<script src="lib/opd_parse.js"></script>
+<script src="lib/opd_lineage.js"></script>
+<script src="lib/opd_course.js"></script>
+<script src="lib/opd_view.js"></script>
+<script src="viewer.js"></script>
