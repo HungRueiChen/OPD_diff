@@ -26,7 +26,19 @@ This matters more than the feature list, so it comes first.
 
 Requests are paced — 400–1000 ms between notes — because the HIS blocks IPs for
 abnormal activity. A patient with a long history genuinely takes a minute or two
-to read. The panel counts visits as it goes, so you can tell it apart from a hang.
+to read, so **the panel fills in while it reads** rather than showing nothing
+until the end.
+
+The visit list comes back in a single request, so the whole record — every date,
+clinic, doctor and diagnosis code — is on screen within a second or two. Visits
+whose notes have not been fetched yet are listed greyed and marked *reading…*.
+Notes then arrive newest first, which means the comparison a clinician usually
+wants is usable within a few seconds of a read that takes two minutes to finish.
+The header shows how far it has got ("12 of 138 visits read"), and your tab,
+selection, filters and scroll position all survive each refresh.
+
+You can open the full-tab view part-way through; it takes a snapshot of what has
+been read so far, and the read carries on in the original tab.
 
 ---
 
@@ -51,8 +63,20 @@ bottom-right corner.
 | Tab | What it shows |
 |---|---|
 | **Compare** | Two or more visits side by side. Underlined text was added in that column; struck-through text is dropped by the next one. Everything — text and numbers alike — is measured against the column to its left. |
-| **Blame** | One visit, with every run of text coloured by the visit that first wrote it, oldest blue through newest red. Removed text can be shown or hidden. |
+| **Blame** | One visit, with every run of text coloured by the visit that first wrote it, oldest blue through newest red. Removed text can be shown or hidden. While the read is still running, text whose origin has not been traced yet is **grey and dashed** instead of coloured — see below. |
 | **Course (beta)** | A chronological timeline of what the attending newly wrote, with category chips. |
+
+**Blame is provisional until the read finishes, and says so on its face.** Notes
+are fetched newest first, so a note's ancestors arrive *after* it. Until they do,
+every line looks original to the visit you are reading — which is the opposite of
+what Blame is for. Measured on one patient: for the first five notes the newest
+note read as 100% written that day; the moment its parent arrived that fell to
+4%. So text that has not been traced past the oldest visit read so far is drawn
+grey and dashed and claims no date, and the tab carries a line saying how far the
+read has got. Attribution can still move in *both* directions while loading —
+across that patient's whole read, 143 attributions shifted to an older visit and
+2 shifted to a newer one when an arriving note re-pointed a parent — so treat
+colours as settled only once the header stops saying "still reading".
 
 **Course is beta and labelled so.** The text it quotes is real, but the category
 chips are frequently wrong: one sentence usually carries several categories at
@@ -92,10 +116,27 @@ python test/guard_tests.py          # the PHI guard
 python tools/make_fixture_js.py     # bundle fixtures for the browser harnesses
 python test/run_harness.py --summary   # parser/lineage/course over every fixture
 python test/run_view.py --mode compare # render a tab in headless Chrome
+python test/run_view.py --mode blame --stream 0 --stream-stop 1   # a half-read view
 ```
 
 `run_harness.py --summary` aggregates the whole corpus and then names only the
 cases that look wrong. Run it after any change to the parsing modules.
+
+`run_view.py --stream [ms]` replays a fixture the way a live capture arrives —
+visit list first, then notes newest-first on a timer — and `--stream-stop n`
+halts after *n* notes and leaves the page in that half-read state. Against the
+real HIS those states last about a minute, cannot be paused, and differ every
+time; this is the only way to inspect them. `--stream-stop 1` is the one worth
+looking at, because with a single note read the whole note is untraced and Blame
+must claim nothing.
+
+A replay that runs to completion converges on the **same DOM** as a direct render
+of the same fixture, and that is the property to re-check after touching
+`opd_stream.js` or `mount`/`update` in `opd_view.js`. Compare the markup, not the
+screenshot: under `--stream` the image is sometimes captured mid-update, so two
+identical runs can differ by a few dozen bytes while the finished markup is
+byte-for-byte the same. Asserting on the picture would give you a test that fails
+at random.
 
 ### Patient data
 

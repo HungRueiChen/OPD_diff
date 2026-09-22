@@ -350,6 +350,22 @@
     // whether findOpd returns full history or a default window.
     capture.pagingHints = collectPagingHints(doc);
 
+    // The list is ONE request, and it already carries every visit's date,
+    // clinic, doctor and diagnosis codes. Hand it over before fetching a single
+    // note so a caller can draw the whole record immediately: the notes then
+    // take a minute or two to arrive, and a surface that is already populated
+    // reads as filling in rather than as hanging.
+    //
+    // The live capture object is passed, not a copy, so a caller can hand over
+    // what has been read so far at any moment.
+    if (typeof options.onList === "function") {
+      try {
+        options.onList(capture);
+      } catch (e) {
+        console.warn("[OPD_diff] onList threw; continuing:", e);
+      }
+    }
+
     var fetched = 0;
     for (var i = 0; i < rows.length && fetched < max; i++) {
       var noteUrl = noteUrlForRow(rows[i]);
@@ -377,6 +393,18 @@
             options.onProgress(fetched, total);
           } catch (e) {
             console.warn("[OPD_diff] onProgress threw; continuing:", e);
+          }
+        }
+        // onProgress reports a count; onNote hands over the note itself, which
+        // is what lets a caller render this visit before the next one is even
+        // requested. Separate callbacks on purpose: the console workflow wants
+        // only the count, and changing onProgress's signature would have broken
+        // it silently.
+        if (typeof options.onNote === "function") {
+          try {
+            options.onNote(page, fetched, total);
+          } catch (e) {
+            console.warn("[OPD_diff] onNote threw; continuing:", e);
           }
         }
       } catch (e) {
@@ -566,7 +594,7 @@
 
   window.OPDCapture = { run: run, collect: collect, captureFailed: captureFailed,
                         runBatch: runBatch, stop: stop, normalizeHistno: normalizeHistno,
-                        wardHistnos: wardHistnos, getPage: getPage, version: 5 };
+                        wardHistnos: wardHistnos, getPage: getPage, version: 6 };
   console.log("[OPD_diff] capture.js ready.\n" +
               "  one patient : OPDCapture.run(\"<chart number>\")\n" +
               "  a ward      : OPDCapture.runBatch(OPDCapture.wardHistnos())\n" +

@@ -209,8 +209,11 @@
 
   function mount(rootEl, data, options) {
     const opts = Object.assign({ maxColumns: MAX_COLUMNS }, options);
-    const nodes = data.lineage.nodes;
-    const course = data.course;
+    // Mutable, because update() swaps the whole model in as a capture streams.
+    // Everything below reads through these three, never through the argument.
+    let model = data;
+    let nodes = model.lineage.nodes;
+    let course = model.course;
 
     /* Default to the most recent visit that has a parent, plus that parent: the
      * comparison a clinician opens this for. Falling back to "the last two rows"
@@ -237,6 +240,12 @@
       // chain leaves one dead block per stop and the surviving note -- the thing
       // actually selected -- ends up buried under its own history.
       blameShowRemoved: false,
+      /* Set the moment the reader ticks anything. Until then the default
+       * selection is recomputed on every update, so a streaming load slides
+       * forward to the newest comparable pair as soon as one exists. After it,
+       * the reader's choice is never overridden -- a selection that jumped out
+       * from under someone mid-read would be worse than a slow one. */
+      userPicked: false,
     };
 
     rootEl.textContent = "";
@@ -247,28 +256,58 @@
     const listEl = el("div", { class: "opd-list" });
     const mainEl = el("main", { class: "opd-main" });
     const countEl = el("span", { class: "opd-sub", text: "" });
+    const subEl = el("span", { class: "opd-sub", text: "" });
     const tabButtons = {};
+
+    function streaming() { return model.done === false; }
 
     function selectedNodes() {
       return nodes.filter((n) => state.selected.has(n.visit.key)).slice(0, opts.maxColumns);
     }
 
-    /* Newest first, the way the HIS lists visits. The underlying array stays in
-     * chronological order, which every diff depends on. */
-    function shownNodes() {
+    /* Every visit the list advertised, newest first, INCLUDING those whose note
+     * has not been read yet -- they appear as pending rows.
+     *
+     * The visit list arrives in a single request, so the picker is complete from
+     * the first moment of a read that may take two minutes. Showing only what
+     * has been parsed would make the record appear to grow from nothing, and a
+     * clinician cannot tell that from a record that is simply short.
+     *
+     * Falls back to the loaded nodes when no list was supplied, which is how the
+     * offline harness mounts an already-finished model. */
+    function shownRows() {
       const q = state.query.trim().toLowerCase();
-      return nodes.filter((n) => {
-        const clinic = (n.visit.dept && n.visit.dept.clinic) || "";
+      const byKey = new Map(nodes.map((n) => [n.visit.key, n]));
+      const rows = (model.visits && model.visits.length)
+        ? model.visits.map((v) => ({ visit: v, node: byKey.get(v.key) || null }))
+        : nodes.slice().reverse().map((n) => ({ visit: n.visit, node: n }));
+      return rows.filter((row) => {
+        const clinic = (row.visit.dept && row.visit.dept.clinic) || "";
         if (state.clinic && clinic !== state.clinic) return false;
         if (!q) return true;
-        const hay = [n.visit.date, clinic, n.visit.doctor && n.visit.doctor.name,
-                     (n.visit.icd10 || []).join(" ")].join(" ").toLowerCase();
+        const hay = [row.visit.date, clinic, row.visit.doctor && row.visit.doctor.name,
+                     (row.visit.icd10 || []).join(" ")].join(" ").toLowerCase();
         return hay.indexOf(q) >= 0;
-      }).slice().reverse();
+      });
+    }
+
+    /* The header is rewritten on every update, so it carries the read's
+     * progress: how much of the record is on screen, and whether more is
+     * coming. "12 of 138 visits read" is the difference between a tool that is
+     * working and a tool that has hung. */
+    function refreshHead() {
+      const from = course.patient.from;
+      const to = course.patient.to;
+      const span = (from && to) ? from + " – " + to : "no dates read yet";
+      const total = model.total || course.patient.visits;
+      const read = streaming() && total
+        ? model.loaded + " of " + total + " visits read"
+        : course.patient.visits + " visits";
+      subEl.textContent = read + " · " + span + " · " + course.patient.clinics.length + " clinics";
+      countEl.textContent = state.selected.size + " selected" + (streaming() ? " · still reading…" : "");
     }
 
     function buildHead() {
-      const span = course.patient.from + " – " + course.patient.to;
       // Course sits last and says "beta" on its face. Its classification is not
       // reliable enough to lead with, and a tab that looks like the others
       // borrows a credibility it has not earned.
@@ -286,8 +325,8 @@
         return button;
       }));
       return el("header", { class: "opd-head" }, [
-        el("span", { class: "opd-title", text: data.caseName || "OPD course" }),
-        el("span", { class: "opd-sub", text: course.patient.visits + " visits · " + span + " · " + course.patient.clinics.length + " clinics" }),
+        el("span", { class: "opd-title", text: model.caseName || "OPD course" }),
+        subEl,
         countEl,
         tabs,
       ]);
@@ -302,8 +341,17 @@
         oninput: (e) => { state.query = e.target.value; renderList(); },
       });
       const actions = el("div", { class: "opd-picker-actions" }, [
-        el("button", { text: "Select shown", onclick: () => { shownNodes().forEach((n) => state.selected.add(n.visit.key)); renderList(); renderMain(); } }),
-        el("button", { text: "Clear", onclick: () => { state.selected.clear(); renderList(); renderMain(); } }),
+        // Only rows whose note is actually parsed can be selected: a column for
+        // a visit that has not been read would have nothing to show.
+        el("button", { text: "Select shown", onclick: () => {
+          state.userPicked = true;
+          shownRows().forEach((row) => { if (row.node) state.selected.add(row.visit.key); });
+          renderList(); renderMain();
+        } }),
+        el("button", { text: "Clear", onclick: () => {
+          state.userPicked = true;
+          state.selected.clear(); renderList(); renderMain();
+        } }),
       ]);
       return el("aside", { class: "opd-picker" }, [
         el("div", { class: "opd-picker-head" }, [clinicSel, search, actions]),
@@ -311,39 +359,62 @@
       ]);
     }
 
-    /* Rebuilt only when a filter changes. Ticking a visit updates that row in
-     * place, so the list never scrolls back to the top under the reader. */
+    /* Rebuilt when a filter changes and on every update. Ticking a visit updates
+     * that row in place, so the list never scrolls back to the top under the
+     * reader -- and the saved scrollTop keeps that true while notes stream in
+     * underneath. */
     function renderList() {
       const keepScroll = listEl.scrollTop;
       listEl.textContent = "";
-      const shown = shownNodes();
+      const shown = shownRows();
       if (!shown.length) {
-        listEl.appendChild(el("div", { class: "opd-hint", text: "No visit matches this filter." }));
+        listEl.appendChild(el("div", {
+          class: "opd-hint",
+          text: (model.visits && model.visits.length) || nodes.length
+            ? "No visit matches this filter."
+            : "Reading the visit list…",
+        }));
         return;
       }
-      shown.forEach((n) => {
-        const box = el("input", { type: "checkbox", checked: state.selected.has(n.visit.key) ? "checked" : null });
-        const row = el("div", {
-          class: "opd-visit" + (state.selected.has(n.visit.key) ? " sel" : ""),
+      shown.forEach((row) => {
+        const visit = row.visit;
+        const node = row.node;
+        const selected = state.selected.has(visit.key);
+        const box = el("input", {
+          type: "checkbox",
+          checked: selected ? "checked" : null,
+          disabled: node ? null : "disabled",
+        });
+        const line = el("div", {
+          class: "opd-visit" + (selected ? " sel" : ""),
           onclick: (e) => {
+            // A visit whose note has not arrived cannot be compared yet. It is
+            // shown, so the reader knows it exists and is coming, but it is not
+            // selectable until there is something behind it.
+            if (!node) return;
+            state.userPicked = true;
             if (e.target !== box) box.checked = !box.checked;
-            if (box.checked) state.selected.add(n.visit.key);
-            else state.selected.delete(n.visit.key);
-            row.className = "opd-visit" + (box.checked ? " sel" : "");
+            if (box.checked) state.selected.add(visit.key);
+            else state.selected.delete(visit.key);
+            line.className = "opd-visit" + (box.checked ? " sel" : "");
             renderMain();
           },
         }, [
           box,
           el("div", { class: "opd-visit-main" }, [
-            el("div", { class: "opd-visit-date", text: n.visit.date }),
-            el("div", { class: "opd-visit-meta", text: [(n.visit.dept && n.visit.dept.clinic) || "",
-              (n.visit.doctor && n.visit.doctor.name) || ""].filter(Boolean).join(" · ") }),
-            el("div", {}, (n.visit.icd10 || []).slice(0, 4)
+            el("div", { class: "opd-visit-date", text: visit.date }),
+            el("div", { class: "opd-visit-meta", text: [(visit.dept && visit.dept.clinic) || "",
+              (visit.doctor && visit.doctor.name) || ""].filter(Boolean).join(" · ") }),
+            el("div", {}, (visit.icd10 || []).slice(0, 4)
               .map((code) => el("span", { class: "opd-chip dx", text: code }))
-              .concat(n.isBaseline ? [el("span", { class: "opd-chip base", text: "baseline" })] : [])),
+              .concat(node && node.isBaseline ? [el("span", { class: "opd-chip base", text: "baseline" })] : [])
+              .concat(node ? [] : [el("span", { class: "opd-chip", text: "reading…" })])),
           ]),
         ]);
-        listEl.appendChild(row);
+        // Inline rather than a class: the pending state is transient and this
+        // keeps the stylesheet describing the finished view only.
+        if (!node) { line.style.opacity = ".55"; line.style.cursor = "default"; }
+        listEl.appendChild(line);
       });
       listEl.scrollTop = keepScroll;
     }
@@ -465,7 +536,13 @@
     function renderCompare() {
       const picked = selectedNodes();
       if (picked.length < 2) {
-        return el("div", { class: "opd-hint", text: "Pick two or more visits on the left to compare them side by side." });
+        // Early in a read there is nothing to pick yet, so the standing
+        // instruction would be telling the reader to do something impossible.
+        // Say what is actually happening instead.
+        const waiting = streaming() && nodes.length < 2;
+        return el("div", { class: "opd-hint", text: waiting
+          ? "Reading visits… the two most recent will appear here side by side as soon as they arrive."
+          : "Pick two or more visits on the left to compare them side by side." });
       }
       const wrap = el("div", {});
       wrap.appendChild(el("div", { class: "opd-legend" }, [
@@ -590,6 +667,34 @@
       }));
       wrap.appendChild(el("div", { class: "opd-legend" }, controls));
 
+      /* Blame over a capture that is still arriving needs this warning, and it
+       * is not a formality.
+       *
+       * Notes arrive NEWEST FIRST, so a note's ancestors land after it. Until
+       * they do, every line looks original to the visit being read -- and blame
+       * exists precisely to say which lines are new. Measured on one patient:
+       * for the first five notes the newest note read as 100% written that day;
+       * when its parent arrived that fell to 4%. Rendering that without saying
+       * so would tell a clinician the opposite of the truth.
+       *
+       * Hence the grey below, and hence this line. Attribution is also not a
+       * one-way settling: across that patient's whole load 143 attributions
+       * moved to an older visit and 2 moved to a newer one, when an arriving
+       * note re-pointed a parent and reshaped the chain. Rare, but it means
+       * "provisional", not merely "incomplete". */
+      if (streaming()) {
+        const warn = el("div", { class: "opd-legend" }, [
+          el("span", {
+            text: "Still reading older visits (" + model.loaded + " of " +
+                  (model.total || "?") + "). Text in grey is not yet traced — its " +
+                  "origin may be a visit that has not been read. Attribution can " +
+                  "still change in both directions until the read finishes.",
+          }),
+        ]);
+        warn.style.color = "#9c640c";
+        wrap.appendChild(warn);
+      }
+
       const result = OPDLineage.blame(nodes, node.index, state.blameSection,
                                       { granularity: state.blameGranularity });
       if (!result.segments.length) {
@@ -611,30 +716,52 @@
         return stop;
       })));
 
+      /* While the capture is still arriving, text credited to the OLDEST visit
+       * read so far is exactly the text whose real origin is still unknown: the
+       * chain root is only a root because nothing older has been fetched yet.
+       * Those runs are drawn in grey with a dashed underline and make no claim
+       * about a date. Everything mid-chain has a visit on both sides of it and
+       * is shown normally. */
+      const rootIndex = chain.length ? chain[0].index : null;
+      const UNTRACED = "#8a949e";
+
       const pre = el("pre", { class: "opd-blame" });
       OPDLineage.blameRuns(result.segments)
         .filter((run) => state.blameShowRemoved || !run.removedAt)
         .forEach((run) => {
+          const untraced = streaming() && run.addedIndex === rootIndex;
           const t = position.has(run.addedIndex) ? position.get(run.addedIndex) : 1;
           const span = el("span", {
             class: run.removedAt ? "opd-mark opd-del" : "opd-mark",
-            title: "written " + run.addedAt + (run.removedAt ? " · removed " + run.removedAt : ""),
+            title: untraced
+              ? "not yet traced — older visits are still being read"
+              : "written " + run.addedAt + (run.removedAt ? " · removed " + run.removedAt : ""),
             text: run.text,
           });
-          span.style.borderBottom = "2px solid " + jetCss(t);
-          span.style.background = jetCss(t, run.removedAt ? 0.07 : 0.18);
-          if (run.removedAt) span.style.textDecorationColor = jetCss(t);
+          if (untraced) {
+            span.style.borderBottom = "2px dashed " + UNTRACED;
+            if (run.removedAt) span.style.textDecorationColor = UNTRACED;
+          } else {
+            span.style.borderBottom = "2px solid " + jetCss(t);
+            span.style.background = jetCss(t, run.removedAt ? 0.07 : 0.18);
+            if (run.removedAt) span.style.textDecorationColor = jetCss(t);
+          }
           pre.appendChild(span);
         });
       wrap.appendChild(el("div", { class: "opd-blame" }, [pre]));
       return wrap;
     }
 
-    function renderMain() {
-      countEl.textContent = state.selected.size + " selected";
+    /* `keepScroll` is passed only by update(). A mode change or a new selection
+     * should start at the top, but a rebuild triggered by a note arriving must
+     * not yank the page out from under someone who is reading it. */
+    function renderMain(keepScroll) {
+      const at = keepScroll ? mainEl.scrollTop : 0;
+      refreshHead();
       mainEl.textContent = "";
       mainEl.appendChild(state.mode === "course" ? renderCourse()
         : state.mode === "blame" ? renderBlame() : renderCompare());
+      mainEl.scrollTop = at;
     }
 
     container.appendChild(buildHead());
@@ -644,7 +771,28 @@
 
     return {
       renderMain,
-      select: (keys) => { state.selected = new Set(keys); renderList(); renderMain(); },
+      /* Swap in a newer model -- the next throttled rebuild of a capture that is
+       * still arriving. Everything the reader has done (tab, selection, filters,
+       * scroll) lives in `state` and the DOM, not in the model, so it survives.
+       *
+       * The clinic filter is rebuilt because a clinic the reader has never seen
+       * can appear at any point in a read that runs newest-first. */
+      update: (next) => {
+        model = next;
+        nodes = model.lineage.nodes;
+        course = model.course;
+        if (!state.userPicked) state.selected = new Set(defaultSelection());
+        const picker = container.querySelector(".opd-picker");
+        if (picker) picker.replaceWith(buildPicker());
+        renderList();
+        renderMain(true);
+      },
+      select: (keys) => {
+        state.userPicked = true;
+        state.selected = new Set(keys);
+        renderList();
+        renderMain();
+      },
       setMode: (mode) => {
         state.mode = mode;
         Object.keys(tabButtons).forEach((k) => tabButtons[k].setAttribute("aria-pressed", String(k === mode)));
@@ -654,7 +802,7 @@
     };
   }
 
-  const api = { mount, mergeRanges, lineSpans, jet, jetCss, version: 4 };
+  const api = { mount, mergeRanges, lineSpans, jet, jetCss, version: 5 };
   if (typeof module === "object" && module && module.exports) module.exports = api;
   root.OPDView = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -17,18 +17,12 @@
     status.textContent = text;
   }
 
-  /* Same as the overlay's, deliberately duplicated: eight lines are a smaller
-   * cost than a fifth file to keep in the manifest and to copy by hand. */
+  /* Assembly lives in opd_stream.js now, shared with the overlay and the offline
+   * harness. It was duplicated in three places, and a capture handed over
+   * mid-read has to be assembled by exactly the same code that was rendering it
+   * in the other tab a moment earlier. */
   function buildModel(capture) {
-    var list = OPDParse.parseList(capture.list.html);
-    var byRow = new Map(list.visits.map(function (v) { return [v.rowIndex, v]; }));
-    var entries = [];
-    capture.notes.forEach(function (raw) {
-      var visit = byRow.get(raw.rowIndex);
-      if (visit) entries.push({ visit: visit, note: OPDParse.parseNote(raw.html) });
-    });
-    var lineage = OPDLineage.build(entries);
-    return { entries: entries, lineage: lineage, course: OPDCourse.build(lineage) };
+    return OPDStream.buildModel(capture);
   }
 
   chrome.storage.local.get("opdCapture", function (res) {

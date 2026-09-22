@@ -65,9 +65,31 @@ def main() -> int:
     fields = {"mode": arg("--mode", "course"), "case": arg("--case", "0")}
     if "--select" in sys.argv:
         fields["select"] = arg("--select", "")
+    # --stream [ms] replays the fixture the way a live capture arrives: the visit
+    # list first, then notes newest-first on a timer. Against the real HIS the
+    # partially-loaded states last a minute and cannot be paused or
+    # screenshotted, so this is the only way to check what they look like.
+    #
+    # --stream-stop [n] halts the replay after n notes and leaves the page in
+    # that half-read state, which is where the interesting rendering lives: a
+    # picker full of pending rows, and blame that must not yet claim a date.
+    #
+    # The SCREENSHOT of a streamed run is not reproducible: headless capture
+    # races the replay's own timers, so the image is occasionally taken between
+    # a model update and its paint, and two identical invocations can differ by
+    # a few dozen bytes. Measured, not theorised -- the same command produced
+    # 100576 and then 100607 bytes on consecutive attempts. The DOM does NOT
+    # vary, so compare markup (--dump-dom) when you need an assertion; the
+    # screenshot is for looking at, not for diffing.
+    streaming = "--stream" in sys.argv
+    if streaming:
+        fields["stream"] = arg("--stream", "0")
+        if "--stream-stop" in sys.argv:
+            fields["streamstop"] = arg("--stream-stop", "0")
     query = urlencode(fields)
     url = PAGE.as_uri() + "?" + query
-    out = Path(tempfile.gettempdir()) / ("opd_view_%s_%s.png" % (kind, arg("--mode", "course")))
+    label = arg("--mode", "course") + ("_stream" if streaming else "")
+    out = Path(tempfile.gettempdir()) / ("opd_view_%s_%s.png" % (kind, label))
     if out.exists():
         out.unlink()
     profile = Path(tempfile.gettempdir()) / ("opd_diff_view_profile_" + kind)
@@ -75,7 +97,10 @@ def main() -> int:
     cmd = [str(browser), "--headless=new", "--disable-gpu", "--no-first-run",
            "--no-default-browser-check", "--disable-extensions", "--hide-scrollbars",
            "--allow-file-access-from-files", "--user-data-dir=" + str(profile),
-           "--window-size=" + arg("--size", "1680,1000"), "--virtual-time-budget=30000",
+           "--window-size=" + arg("--size", "1680,1000"),
+           # A replay runs the whole capture through the throttle, so it needs
+           # far longer than a one-shot render of the same fixture.
+           "--virtual-time-budget=" + ("180000" if streaming else "30000"),
            "--screenshot=" + str(out), "--dump-dom", url]
     result = subprocess.run(cmd, capture_output=True, timeout=240)
     dom = result.stdout.decode("utf-8", "replace")

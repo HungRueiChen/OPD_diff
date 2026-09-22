@@ -27,6 +27,7 @@
         "lib/opd_parse.js",
         "lib/opd_lineage.js",
         "lib/opd_course.js",
+        "lib/opd_stream.js",
         "lib/opd_view.js",
         "lib/capture.js",
         "content.js"

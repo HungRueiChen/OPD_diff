@@ -4,6 +4,13 @@
  * currently open, builds the copy-forward lineage and course, and mounts the
  * same OPDView the offline harness uses.
  *
+ * The panel fills in AS THE CAPTURE ARRIVES rather than after it finishes. The
+ * visit list comes back in one request, so the whole roster is on screen almost
+ * immediately; notes then arrive newest first and the view re-renders on a
+ * throttle (see opd_stream.js, which owns that pacing). A clinician gets a
+ * usable comparison of the two most recent visits within a few seconds of a read
+ * that may take two minutes to complete.
+ *
  * Everything is mounted inside a SHADOW ROOT. That is not decoration: the HIS
  * ships its own global CSS (jQuery UI, thickbox, a 2009-era Master.css) and
  * OPDView injects its own stylesheet. Without isolation they bleed into each
@@ -40,20 +47,6 @@
     }
     var input = document.querySelector("input[name=histno], input#histno");
     return OPDCapture.normalizeHistno(input ? input.value : null);
-  }
-
-  /* capture -> the model OPDView mounts. Mirrors test/view.html exactly, so the
-   * extension and the offline harness render from identical inputs. */
-  function buildModel(capture) {
-    var list = OPDParse.parseList(capture.list.html);
-    var byRow = new Map(list.visits.map(function (v) { return [v.rowIndex, v]; }));
-    var entries = [];
-    capture.notes.forEach(function (raw) {
-      var visit = byRow.get(raw.rowIndex);
-      if (visit) entries.push({ visit: visit, note: OPDParse.parseNote(raw.html) });
-    });
-    var lineage = OPDLineage.build(entries);
-    return { entries: entries, lineage: lineage, course: OPDCourse.build(lineage) };
   }
 
   var CHROME_CSS = [
@@ -127,6 +120,10 @@
       msg.textContent = "handing over to a new tab…";
       // storage, not a message: a real capture runs past 1.5 MB and that is an
       // awkward thing to post through the extension messaging channel.
+      //
+      // Mid-read this hands over WHAT HAS BEEN READ SO FAR -- the capture object
+      // is the live one, and the new tab is a snapshot of this moment. The read
+      // continues in this tab regardless.
       chrome.storage.local.set({ opdCapture: lastCapture }, function () {
         chrome.runtime.sendMessage({ type: "open-viewer" }, function () {
           void chrome.runtime.lastError;
@@ -190,15 +187,53 @@
     }
 
     ui.msg.textContent = "reading visits…";
+
+    var view = null;
+    function render(model) {
+      var data = {
+        caseName: "chart on screen",
+        visits: model.visits,
+        entries: model.entries,
+        lineage: model.lineage,
+        course: model.course,
+        loaded: model.loaded,
+        total: model.total,
+        done: model.done
+      };
+      // mount() once, update() after: the view keeps the reader's selection,
+      // tab, filters and scroll position across a rebuild, which it could not
+      // do if this tore the panel down and mounted again.
+      if (view) view.update(data);
+      else view = OPDView.mount(ui.mount, data);
+    }
+
+    var stream = OPDStream.create({ onModel: render });
+
     var capture;
     try {
       capture = await OPDCapture.collect(histno, {
-        onProgress: function (done, total) {
+        onList: function (cap) {
+          // Held from the first callback, so "Open in tab" works mid-read.
+          lastCapture = cap;
+          if (OPDCapture.captureFailed(cap)) return;
+          ui.tabBtn.disabled = false;
+          stream.setList(cap.list.html);
+        },
+        onNote: function (page, done, total) {
           ui.msg.textContent = "reading visit " + done + " of " + total + "…";
+          stream.addNote(page);
         }
       });
     } catch (e) {
-      fail(ui, "Could not read this patient.\n\n" + String((e && e.message) || e));
+      // Partway through is not nothing. If the roster is already on screen,
+      // keep what was read and say where it stopped, rather than replacing
+      // forty visits with an error box.
+      if (view) {
+        stream.finish();
+        ui.msg.textContent = "stopped early: " + String((e && e.message) || e);
+      } else {
+        fail(ui, "Could not read this patient.\n\n" + String((e && e.message) || e));
+      }
       return;
     }
 
@@ -216,24 +251,13 @@
       return;
     }
 
-    lastCapture = capture;
-    ui.tabBtn.disabled = false;
+    var model = stream.finish();
     ui.msg.textContent = capture.notes.length + " visit(s) read";
 
-    var model;
-    try {
-      model = buildModel(capture);
-    } catch (e) {
-      fail(ui, "Read the visits, but could not parse them.\n\n" + String((e && e.message) || e));
-      return;
+    if (!model.entries.length) {
+      fail(ui, "Read " + capture.notes.length + " note(s), but none of them matched a " +
+               "row in the visit list, so there is nothing to line up.");
     }
-
-    OPDView.mount(ui.mount, {
-      caseName: "chart on screen",
-      entries: model.entries,
-      lineage: model.lineage,
-      course: model.course
-    });
   }
 
   button.addEventListener("click", function () { load(); });

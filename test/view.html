@@ -17,6 +17,7 @@
 <script src="../src/opd_parse.js"></script>
 <script src="../src/opd_lineage.js"></script>
 <script src="../src/opd_course.js"></script>
+<script src="../src/opd_stream.js"></script>
 <script src="../src/opd_view.js"></script>
 <script>
 (function () {
@@ -29,35 +30,80 @@
     var name = names[Math.min(names.length - 1, Math.max(0, parseInt(params.get("case") || "0", 10)))];
     var capture = window.OPD_FIXTURES[name];
 
-    var list = OPDParse.parseList(capture.list.html);
-    var byRow = new Map(list.visits.map(function (v) { return [v.rowIndex, v]; }));
-    var entries = [];
-    capture.notes.forEach(function (raw) {
-      var visit = byRow.get(raw.rowIndex);
-      if (visit) entries.push({ visit: visit, note: OPDParse.parseNote(raw.html) });
-    });
-    var lineage = OPDLineage.build(entries);
-    var course = OPDCourse.build(lineage);
+    var caseName = name.replace(/^opd-capture-/, "case ");
+    var app = document.getElementById("app");
+    var view = null;
 
-    var view = OPDView.mount(document.getElementById("app"), {
-      caseName: name.replace(/^opd-capture-/, "case "),
-      entries: entries, lineage: lineage, course: course,
-    });
-
-    var select = params.get("select");
-    if (select) {
-      var keys = select.split(",")
-        .map(function (s) { return parseInt(s, 10); })
-        .filter(function (n) { return !isNaN(n) && n >= 0 && n < lineage.nodes.length; })
-        .map(function (n) { return lineage.nodes[n].visit.key; });
-      if (keys.length) view.select(keys);
+    function applyParams(lineage) {
+      var select = params.get("select");
+      if (select) {
+        var keys = select.split(",")
+          .map(function (s) { return parseInt(s, 10); })
+          .filter(function (n) { return !isNaN(n) && n >= 0 && n < lineage.nodes.length; })
+          .map(function (n) { return lineage.nodes[n].visit.key; });
+        if (keys.length) view.select(keys);
+      }
+      var mode = params.get("mode");
+      // "course" is listed explicitly now that it is no longer the default mode:
+      // without it, --mode course would silently render Compare instead.
+      if (mode === "compare" || mode === "blame" || mode === "course") view.setMode(mode);
     }
-    var mode = params.get("mode");
-    // "course" is listed explicitly now that it is no longer the default mode:
-    // without it, --mode course would silently render Compare instead.
-    if (mode === "compare" || mode === "blame" || mode === "course") view.setMode(mode);
 
-    status.textContent = "VIEW OK " + entries.length + " visits, " + view.state.selected.size + " selected";
+    function render(model) {
+      var data = {
+        caseName: caseName,
+        visits: model.visits, entries: model.entries,
+        lineage: model.lineage, course: model.course,
+        loaded: model.loaded, total: model.total, done: model.done,
+      };
+      if (view) view.update(data);
+      else { view = OPDView.mount(app, data); applyParams(model.lineage); }
+      status.textContent = (model.done ? "VIEW OK " : "VIEW STREAMING ") +
+        model.loaded + "/" + model.total + " visits, " +
+        view.state.selected.size + " selected";
+    }
+
+    /* ?stream=<ms> replays the fixture the way a live capture arrives -- list
+     * first, then notes newest-first on a timer. That is the only way to see the
+     * partially-loaded states offline: against the real HIS they last a minute
+     * and cannot be paused, screenshotted or diffed. ?stream=0 replays as fast
+     * as the event loop allows. */
+    var streamArg = params.get("stream");
+    if (streamArg !== null) {
+      var gap = Math.max(0, parseInt(streamArg, 10) || 0);
+      // ?streamstop=<n> halts after n notes and leaves the page half-read. That
+      // state is the one worth looking at: pending rows in the picker, and a
+      // blame view that must not yet claim a date for anything. Without it the
+      // replay always ends complete and the interesting rendering is never seen.
+      var stopAfter = parseInt(params.get("streamstop") || "", 10);
+      var limit = (!isNaN(stopAfter) && stopAfter >= 0)
+        ? Math.min(stopAfter, capture.notes.length)
+        : capture.notes.length;
+      var stream = OPDStream.create({ onModel: render });
+      stream.setList(capture.list.html);
+      var at = 0;
+      (function next() {
+        if (at >= limit) {
+          // finish() only when the whole capture really was replayed. Calling it
+          // at a deliberate stop would mark the model done and erase the very
+          // half-read state this is here to show. A throttled rebuild is already
+          // scheduled, so the last notes still reach the screen on their own.
+          if (limit >= capture.notes.length) { applyParams(stream.finish().lineage); return; }
+          // ?select= has to be applied again here. At first mount the list had
+          // arrived but no notes had, so there were no nodes to resolve an index
+          // against and the selection was silently dropped -- which left two
+          // visits selected by default, and Blame renders nothing unless exactly
+          // one is. Wait out the pending rebuild first so the indices refer to
+          // everything that was actually read.
+          setTimeout(function () { applyParams(stream.model().lineage); }, 50);
+          return;
+        }
+        stream.addNote(capture.notes[at++]);
+        setTimeout(next, gap);
+      })();
+    } else {
+      render(OPDStream.buildModel(capture));
+    }
   } catch (e) {
     status.hidden = false;
     status.textContent = "VIEW ERROR\n" + ((e && e.stack) || e);

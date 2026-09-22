@@ -33,6 +33,7 @@ MODULES = [
     "opd_parse.js",
     "opd_lineage.js",
     "opd_course.js",
+    "opd_stream.js",
     "opd_view.js",
     "capture.js",
 ]
