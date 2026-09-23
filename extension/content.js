@@ -11,6 +11,13 @@
  * usable comparison of the two most recent visits within a few seconds of a read
  * that may take two minutes to complete.
  *
+ * "Open in tab" hands the SAME READ over to a full tab, live. This page stays
+ * the only thing talking to the HIS -- the viewer tab never issues a request of
+ * its own -- so opening it does not double the request rate against a server
+ * this project has been careful not to hammer. The handover works by publishing
+ * each note into chrome.storage.local as it lands; the viewer subscribes. See
+ * publish() below for why it is one key per note rather than one blob.
+ *
  * Everything is mounted inside a SHADOW ROOT. That is not decoration: the HIS
  * ships its own global CSS (jQuery UI, thickbox, a 2009-era Master.css) and
  * OPDView injects its own stylesheet. Without isolation they bleed into each
@@ -47,6 +54,98 @@
     }
     var input = document.querySelector("input[name=histno], input#histno");
     return OPDCapture.normalizeHistno(input ? input.value : null);
+  }
+
+  // ------------------------------------------------------------- handover
+  //
+  // One key per note, written once, rather than one key holding the whole
+  // capture rewritten on every update. A long record runs to several megabytes,
+  // chrome.storage.local is quota'd, and rewriting that blob every couple of
+  // seconds for two minutes would churn hard enough to be felt -- while a quota
+  // failure would look exactly like success, which is the same silent-failure
+  // shape this project has already been bitten by in the HIS itself.
+  //
+  // Nothing is published until the reader actually asks for a tab, so a read
+  // that stays in the overlay costs no storage at all.
+
+  var NOTE_PREFIX = "opdNote:";
+  var BATCH = 25;
+
+  // A random token, not a timestamp: a date literal in a key is the shape
+  // deid.py matches, and the viewer only needs to tell one read from the next.
+  var sessionId = null;
+  var liveCapture = null;
+  var publishing = false;
+
+  function noteKey(rowIndex) { return NOTE_PREFIX + sessionId + ":" + rowIndex; }
+
+  function setLocal(obj, done) {
+    chrome.storage.local.set(obj, function () {
+      var err = chrome.runtime.lastError;
+      if (done) done(err || null);
+      else if (err) console.warn("[OPD_diff] storage write failed:", err.message);
+    });
+  }
+
+  /* Drop everything a previous read left behind, so two patients can never be
+   * mixed in one viewer and so the quota is not slowly eaten by old captures. */
+  function clearPublished(done) {
+    chrome.storage.local.get(null, function (all) {
+      var drop = Object.keys(all || {}).filter(function (k) {
+        return k === "opdCapture" || k === "opdStatus" || k.indexOf(NOTE_PREFIX) === 0;
+      });
+      if (!drop.length) return done();
+      chrome.storage.local.remove(drop, function () {
+        void chrome.runtime.lastError;
+        done();
+      });
+    });
+  }
+
+  function statusRecord(capture, done) {
+    return {
+      session: sessionId,
+      loaded: capture.notes.length,
+      total: capture.rowsTotal || capture.notes.length,
+      done: Boolean(done)
+    };
+  }
+
+  function writeNotes(notes, done) {
+    var at = 0;
+    (function step() {
+      if (at >= notes.length) return done(null);
+      var batch = {};
+      for (var n = 0; n < BATCH && at < notes.length; n++, at++) {
+        batch[noteKey(notes[at].rowIndex)] = notes[at];
+      }
+      setLocal(batch, function (err) {
+        if (err) return done(err);
+        step();
+      });
+    })();
+  }
+
+  /* Publish what has been read so far, then let onNote keep the tab fed. The
+   * visit list goes over on its own so the viewer can draw the whole roster
+   * immediately, exactly as this panel does -- including when the tab is opened
+   * before a single note has arrived. */
+  function publish(capture, done) {
+    clearPublished(function () {
+      var meta = {
+        session: sessionId,
+        origin: capture.origin,
+        list: capture.list,
+        rowsTotal: capture.rowsTotal
+      };
+      setLocal({ opdCapture: meta }, function (err) {
+        if (err) return done(err);
+        writeNotes(capture.notes, function (err2) {
+          if (err2) return done(err2);
+          setLocal({ opdStatus: statusRecord(capture, false) }, done);
+        });
+      });
+    });
   }
 
   var CHROME_CSS = [
@@ -88,7 +187,6 @@
   shadow.appendChild(button);
 
   var panel = null;
-  var lastCapture = null;
 
   function closePanel() {
     if (panel) { panel.remove(); panel = null; }
@@ -115,19 +213,26 @@
     tabBtn.textContent = "Open in tab";
     tabBtn.disabled = true;
     tabBtn.addEventListener("click", function () {
-      if (!lastCapture) return;
+      if (!liveCapture) return;
       tabBtn.disabled = true;
       msg.textContent = "handing over to a new tab…";
-      // storage, not a message: a real capture runs past 1.5 MB and that is an
-      // awkward thing to post through the extension messaging channel.
-      //
-      // Mid-read this hands over WHAT HAS BEEN READ SO FAR -- the capture object
-      // is the live one, and the new tab is a snapshot of this moment. The read
-      // continues in this tab regardless.
-      chrome.storage.local.set({ opdCapture: lastCapture }, function () {
+      // Set BEFORE publishing, not after. publish() is several asynchronous
+      // storage writes long, and a note arriving in the middle of it would
+      // otherwise fall between the snapshot and the live feed and reach the tab
+      // never. Writing one note twice is harmless; missing one is not.
+      publishing = true;
+      publish(liveCapture, function (err) {
+        if (err) {
+          // Loud, not silent. A failed write here would otherwise leave a tab
+          // that simply never fills in, with nothing anywhere saying why.
+          publishing = false;
+          msg.textContent = "could not hand over: " + err.message;
+          tabBtn.disabled = false;
+          return;
+        }
         chrome.runtime.sendMessage({ type: "open-viewer" }, function () {
           void chrome.runtime.lastError;
-          msg.textContent = "opened in a new tab.";
+          msg.textContent = "following in a new tab — keep this tab open.";
           tabBtn.disabled = false;
         });
       });
@@ -186,6 +291,9 @@
       return;
     }
 
+    sessionId = Math.random().toString(36).slice(2, 10);
+    liveCapture = null;
+    publishing = false;
     ui.msg.textContent = "reading visits…";
 
     var view = null;
@@ -213,21 +321,30 @@
     try {
       capture = await OPDCapture.collect(histno, {
         onList: function (cap) {
-          // Held from the first callback, so "Open in tab" works mid-read.
-          lastCapture = cap;
+          liveCapture = cap;
           if (OPDCapture.captureFailed(cap)) return;
+          // Enabled as soon as the roster exists: the viewer draws the same
+          // pending-row list this panel does, so an early click is useful
+          // rather than an empty page.
           ui.tabBtn.disabled = false;
           stream.setList(cap.list.html);
         },
         onNote: function (page, done, total) {
           ui.msg.textContent = "reading visit " + done + " of " + total + "…";
           stream.addNote(page);
+          if (publishing) {
+            var batch = {};
+            batch[noteKey(page.rowIndex)] = page;
+            batch.opdStatus = statusRecord(liveCapture, false);
+            setLocal(batch);
+          }
         }
       });
     } catch (e) {
       // Partway through is not nothing. If the roster is already on screen,
       // keep what was read and say where it stopped, rather than replacing
       // forty visits with an error box.
+      if (publishing && liveCapture) setLocal({ opdStatus: statusRecord(liveCapture, true) });
       if (view) {
         stream.finish();
         ui.msg.textContent = "stopped early: " + String((e && e.message) || e);
@@ -252,6 +369,8 @@
     }
 
     var model = stream.finish();
+    // Tells the viewer to stop saying "still reading" and settle its colours.
+    if (publishing) setLocal({ opdStatus: statusRecord(capture, true) });
     ui.msg.textContent = capture.notes.length + " visit(s) read";
 
     if (!model.entries.length) {

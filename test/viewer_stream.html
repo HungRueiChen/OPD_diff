@@ -1,0 +1,252 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPD_diff viewer handover harness</title>
+<!--
+  Drives extension/viewer.js for real, against a fake chrome.storage.
+
+  The viewer is the one surface the offline harnesses could not reach: it is fed
+  entirely by chrome.storage.local, which does not exist outside an extension. So
+  the handover shipped verified by inspection only -- and a handover that did not
+  work cost a trip to the hospital network to discover.
+
+  This stubs storage in memory, with a working onChanged, and replays what the
+  content script does: publish the visit list, then drip notes in one at a time,
+  then mark the read done. It asserts the things that actually broke or could:
+
+    1. A handover with ZERO notes still draws the whole roster. That is the
+       earliest possible click, and it used to produce "Nothing to show yet".
+    2. The tab mounts ONCE and then updates -- not remounts, which would throw
+       away the reader's tab, selection, filters and scroll on every note.
+    3. Notes arriving after the page loaded actually reach the view.
+    4. The status record settles the view at done, so it stops saying
+       "still reading" and its blame colours stop being provisional.
+
+  Usage:  python test/run_viewer_stream.py [--edge] [--case 51]
+-->
+<style>html,body{height:100%;margin:0}#app{height:60%}#out{padding:8px;font:12px/1.5 monospace;white-space:pre-wrap}</style>
+<div id="app"></div>
+<pre id="status" hidden></pre>
+<pre id="out">did not run</pre>
+
+<script>
+/* The stub must be installed BEFORE viewer.js loads, because viewer.js reads
+ * storage the moment it runs. Everything is async via setTimeout, like the real
+ * API, so ordering bugs that a synchronous fake would hide still show up. */
+(function () {
+  "use strict";
+  var store = {};
+  var listeners = [];
+
+  window.chrome = {
+    runtime: { lastError: null },
+    storage: {
+      local: {
+        get: function (keys, cb) {
+          var out = {};
+          if (keys === null || keys === undefined) {
+            Object.keys(store).forEach(function (k) { out[k] = store[k]; });
+          } else if (typeof keys === "string") {
+            if (Object.prototype.hasOwnProperty.call(store, keys)) out[keys] = store[keys];
+          } else if (Array.isArray(keys)) {
+            keys.forEach(function (k) {
+              if (Object.prototype.hasOwnProperty.call(store, k)) out[k] = store[k];
+            });
+          }
+          setTimeout(function () { cb(out); }, 0);
+        },
+        set: function (obj, cb) {
+          var changes = {};
+          Object.keys(obj).forEach(function (k) {
+            changes[k] = { oldValue: store[k], newValue: obj[k] };
+            store[k] = obj[k];
+          });
+          setTimeout(function () {
+            if (cb) cb();
+            listeners.forEach(function (fn) { fn(changes, "local"); });
+          }, 0);
+        },
+        remove: function (keys, cb) {
+          var list = Array.isArray(keys) ? keys : [keys];
+          var changes = {};
+          list.forEach(function (k) {
+            if (!Object.prototype.hasOwnProperty.call(store, k)) return;
+            changes[k] = { oldValue: store[k], newValue: undefined };
+            delete store[k];
+          });
+          setTimeout(function () {
+            if (cb) cb();
+            listeners.forEach(function (fn) { fn(changes, "local"); });
+          }, 0);
+        }
+      },
+      onChanged: { addListener: function (fn) { listeners.push(fn); } }
+    }
+  };
+  window.__store = store;
+})();
+</script>
+
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script src="../src/opd_stream.js"></script>
+<script src="../src/opd_view.js"></script>
+
+<script>
+/* Record how the view is driven. A remount per note would look fine in a
+ * screenshot and be wrong in the only way that matters to a reader. */
+(function () {
+  "use strict";
+  window.__trace = { mounts: 0, updates: 0, states: [] };
+  var realMount = OPDView.mount;
+  function note(data) {
+    window.__trace.states.push(data.loaded + "/" + data.total + (data.done ? " done" : ""));
+  }
+  OPDView.mount = function (el, data) {
+    window.__trace.mounts++;
+    note(data);
+    var view = realMount(el, data);
+    var realUpdate = view.update;
+    view.update = function (next) {
+      window.__trace.updates++;
+      note(next);
+      return realUpdate(next);
+    };
+    return view;
+  };
+})();
+</script>
+
+<script>
+/* Publish the visit list and NOTHING else, then load viewer.js. This is the
+ * earliest possible "Open in tab": the roster exists, no note has arrived. */
+(function () {
+  "use strict";
+  var params = new URLSearchParams(location.search);
+  var names = Object.keys(window.OPD_FIXTURES || {});
+  var idx = Math.min(names.length - 1, Math.max(0, parseInt(params.get("case") || "51", 10)));
+  var capture = window.OPD_FIXTURES[names[idx]];
+  window.__case = { name: names[idx], notes: capture.notes.length };
+  window.__capture = capture;
+
+  chrome.storage.local.set({
+    opdCapture: {
+      session: "testsession",
+      origin: capture.origin,
+      list: capture.list,
+      rowsTotal: (capture.rowSurvey && capture.rowSurvey.rows.length) || capture.notes.length
+    },
+    opdStatus: { session: "testsession", loaded: 0, total: capture.notes.length, done: false }
+  });
+})();
+</script>
+
+<script src="../extension/viewer.js"></script>
+
+<script>
+(function () {
+  "use strict";
+  var out = document.getElementById("out");
+  var capture = window.__capture;
+  var trace = window.__trace;
+
+  function rosterRows() {
+    var host = document.querySelector("#app .opd-list");
+    return host ? host.querySelectorAll(".opd-visit").length : 0;
+  }
+
+  function finish(report) {
+    var fails = report.failures;
+    out.textContent = (fails.length ? "VIEWER FAIL\n" : "VIEWER OK\n") +
+      JSON.stringify(report, null, 2);
+  }
+
+  // Let viewer.js do its initial storage read first.
+  setTimeout(function () {
+    var rosterBeforeAnyNote = rosterRows();
+    var mountsBeforeNotes = trace.mounts;
+
+    /* The gap between notes matters, and getting it wrong made the first run of
+     * this harness worthless.
+     *
+     * At a 1 ms drip every note landed inside a single rebuild throttle window,
+     * so the view went "0/49" -> "49/49 done" with exactly one update and no
+     * intermediate render at all -- which is the very failure this file exists
+     * to catch, reported as a pass. A real read is paced at 400-1000 ms per
+     * note, which is several throttle windows, so pace it like one. */
+    var gap = parseInt(new URLSearchParams(location.search).get("gap") || "400", 10);
+    if (!(gap >= 0)) gap = 400;
+
+    var at = 0;
+    (function drip() {
+      if (at >= capture.notes.length) {
+        chrome.storage.local.set({
+          opdStatus: { session: "testsession", loaded: capture.notes.length,
+                       total: capture.notes.length, done: true }
+        });
+        // Long enough for the final rebuild to land, whatever the throttle was
+        // holding at the time.
+        setTimeout(report, 3000);
+        return;
+      }
+      var page = capture.notes[at++];
+      var obj = {};
+      obj["opdNote:testsession:" + page.rowIndex] = page;
+      obj.opdStatus = { session: "testsession", loaded: at,
+                        total: capture.notes.length, done: false };
+      chrome.storage.local.set(obj);
+      setTimeout(drip, gap);
+    })();
+
+    function report() {
+      var last = trace.states[trace.states.length - 1] || "";
+      var failures = [];
+      // A render that is neither the initial empty roster nor the finished
+      // state. Without at least one, nothing was ever shown mid-read.
+      var intermediate = trace.states.filter(function (s, i) {
+        return i > 0 && s.indexOf(" done") < 0;
+      });
+
+      if (rosterBeforeAnyNote < 2) {
+        failures.push("roster not drawn before any note arrived (" +
+                      rosterBeforeAnyNote + " rows) -- the earliest handover is blank");
+      }
+      if (mountsBeforeNotes !== 1) {
+        failures.push("expected exactly 1 mount before notes, saw " + mountsBeforeNotes);
+      }
+      if (trace.mounts !== 1) {
+        failures.push("view remounted " + trace.mounts + " times; it must mount once and update");
+      }
+      if (!intermediate.length) {
+        failures.push("NO INTERMEDIATE RENDER: the view went straight from empty to " +
+                      "finished, which is exactly the static behaviour this checks for. " +
+                      "If the drip gap is tiny this is the harness's fault, not the " +
+                      "viewer's -- raise ?gap=");
+      }
+      if (trace.updates < 3) {
+        failures.push("only " + trace.updates + " update(s) across " +
+                      capture.notes.length + " notes; a paced read must repaint repeatedly");
+      }
+      if (last.indexOf(" done") < 0) failures.push("view never settled at done, last state: " + last);
+      if (last.indexOf(capture.notes.length + "/") !== 0) {
+        failures.push("final state " + last + " did not load all " +
+                      capture.notes.length + " notes");
+      }
+      finish({
+        "case": window.__case.name,
+        notesInFixture: capture.notes.length,
+        dripGapMs: gap,
+        rosterRowsBeforeAnyNote: rosterBeforeAnyNote,
+        mounts: trace.mounts,
+        updates: trace.updates,
+        intermediateRenders: intermediate.length,
+        firstState: trace.states[0] || null,
+        lastState: last,
+        sampledStates: trace.states.slice(0, 8),
+        failures: failures
+      });
+    }
+  }, 50);
+})();
+</script>

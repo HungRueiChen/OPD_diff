@@ -1,10 +1,17 @@
 /* OPD_diff -- full-tab viewer.
  *
- * Reads the capture the overlay left in chrome.storage.local and mounts the same
- * OPDView. This page never talks to the HIS: it has no session and needs none,
- * because the content script already fetched everything in the authenticated
- * page. That also means opening this tab directly, without going through the
- * overlay first, correctly shows nothing.
+ * Follows the read happening in the HIS tab, live. The content script publishes
+ * the visit list and then each note into chrome.storage.local as it lands; this
+ * page subscribes and re-renders on the same throttle the overlay uses.
+ *
+ * This page NEVER talks to the HIS. It has no session and needs none, and more
+ * to the point it must not: the overlay is already fetching, and a second reader
+ * would double the request rate against a server that blocks IPs for abnormal
+ * activity. Everything here comes from storage. That also means opening this
+ * page directly, without going through the overlay, correctly shows nothing.
+ *
+ * Closing or navigating the HIS tab stops the read -- the content script dies
+ * with it -- and this page simply stops receiving notes.
  */
 (function () {
   "use strict";
@@ -17,47 +24,123 @@
     status.textContent = text;
   }
 
-  /* Assembly lives in opd_stream.js now, shared with the overlay and the offline
-   * harness. It was duplicated in three places, and a capture handed over
-   * mid-read has to be assembled by exactly the same code that was rendering it
-   * in the other tab a moment earlier. */
-  function buildModel(capture) {
-    return OPDStream.buildModel(capture);
+  // A folder copied to a ward machine before opd_stream.js existed would fail
+  // here with a bare ReferenceError in a console nobody has open. Say it plainly
+  // instead, and name the fix.
+  if (typeof OPDStream === "undefined" || typeof OPDView === "undefined") {
+    show("This page is missing part of the extension.\n\n" +
+         "Copy the whole extension folder again, then press Reload on its card " +
+         "in chrome://extensions — the browser caches file contents, so a newly " +
+         "copied file is not picked up without it.");
+    return;
   }
 
-  chrome.storage.local.get("opdCapture", function (res) {
-    var capture = res && res.opdCapture;
-    if (!capture || !capture.notes || !capture.notes.length) {
+  var NOTE_PREFIX = "opdNote:";
+
+  var view = null;
+  var stream = null;
+  var session = null;
+  var seen = Object.create(null);
+  var settled = false;
+
+  function render(model) {
+    var data = {
+      caseName: "full record",
+      visits: model.visits,
+      entries: model.entries,
+      lineage: model.lineage,
+      course: model.course,
+      loaded: model.loaded,
+      total: model.total,
+      done: model.done
+    };
+    if (view) {
+      view.update(data);
+    } else {
+      status.hidden = true;
+      view = OPDView.mount(app, data);
+    }
+    // No chart number in the title: a tab title is visible in window lists,
+    // screenshots and session restores.
+    document.title = "OPD_diff — " + model.loaded +
+      (model.done ? "" : " of " + (model.total || "?")) + " visits";
+  }
+
+  function prefix() { return NOTE_PREFIX + session + ":"; }
+
+  /* Order does not matter -- OPDLineage.build sorts chronologically itself --
+   * but the row index does, because it is what joins a note to its visit. */
+  function absorb(all) {
+    var added = false;
+    Object.keys(all || {}).forEach(function (key) {
+      if (key.indexOf(prefix()) !== 0 || seen[key]) return;
+      var page = all[key];
+      if (!page) return;
+      seen[key] = true;
+      if (stream.addNote(page)) added = true;
+    });
+    return added;
+  }
+
+  chrome.storage.local.get(null, function (all) {
+    var err = chrome.runtime.lastError;
+    if (err) {
+      show("Could not read the handover.\n\n" + err.message);
+      return;
+    }
+    var meta = all && all.opdCapture;
+    if (!meta || !meta.list || !meta.list.html) {
       show("Nothing to show yet.\n\n" +
            "Open a patient in the HIS, click the OPD_diff button in the corner of " +
            "the page, then choose \"Open in tab\".");
       return;
     }
 
-    var model;
+    session = meta.session;
     try {
-      model = buildModel(capture);
+      stream = OPDStream.create({ onModel: render });
+      stream.setList(meta.list.html);
+      absorb(all);
+      var st = all.opdStatus;
+      if (st && st.done) { settled = true; stream.finish(); }
     } catch (e) {
-      show("Could not parse the captured visits.\n\n" + String((e && e.stack) || e));
+      show("Could not assemble the captured visits.\n\n" + String((e && e.stack) || e));
+    }
+  });
+
+  chrome.storage.onChanged.addListener(function (changes, area) {
+    if (area !== "local" || !stream) return;
+
+    /* Checked BEFORE the settled guard, deliberately.
+     *
+     * A different session means a new patient is being read in the HIS tab. A
+     * viewer that had finished its own read would otherwise ignore this and sit
+     * there showing the PREVIOUS patient, under a title that looks identical to
+     * the new one's and carries no chart number to tell them apart. Showing one
+     * patient's notes under another patient's roster is the worst failure this
+     * tool could have, so it starts over instead. */
+    if (changes.opdCapture && changes.opdCapture.newValue &&
+        changes.opdCapture.newValue.session !== session) {
+      location.reload();
       return;
     }
+    if (settled) return;
 
-    if (!model.entries.length) {
-      show("The capture holds " + capture.notes.length + " note(s), but none of them " +
-           "matched a row in the visit list, so there is nothing to line up.");
-      return;
-    }
+    var arrived = {};
+    var any = false;
+    Object.keys(changes).forEach(function (key) {
+      if (key.indexOf(prefix()) !== 0) return;
+      var page = changes[key].newValue;
+      if (!page) return;
+      arrived[key] = page;
+      any = true;
+    });
+    if (any) absorb(arrived);
 
-    try {
-      OPDView.mount(app, {
-        caseName: model.entries.length + " visits",
-        entries: model.entries,
-        lineage: model.lineage,
-        course: model.course
-      });
-      document.title = "OPD_diff — " + model.entries.length + " visits";
-    } catch (e) {
-      show("Could not render.\n\n" + String((e && e.stack) || e));
+    var st = changes.opdStatus && changes.opdStatus.newValue;
+    if (st && st.done) {
+      settled = true;
+      stream.finish();
     }
   });
 })();

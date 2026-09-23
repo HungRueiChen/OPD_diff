@@ -37,8 +37,11 @@ wants is usable within a few seconds of a read that takes two minutes to finish.
 The header shows how far it has got ("12 of 138 visits read"), and your tab,
 selection, filters and scroll position all survive each refresh.
 
-You can open the full-tab view part-way through; it takes a snapshot of what has
-been read so far, and the read carries on in the original tab.
+You can open the full-tab view at any point, including before the first note has
+arrived. It **follows the same read live**, filling in as the overlay fetches.
+The fetching stays in the HIS tab — the extra tab never issues a request of its
+own, so opening it does not double the load on the server — which means the HIS
+tab has to stay open. Close it and the read stops.
 
 ---
 
@@ -117,10 +120,21 @@ python tools/make_fixture_js.py     # bundle fixtures for the browser harnesses
 python test/run_harness.py --summary   # parser/lineage/course over every fixture
 python test/run_view.py --mode compare # render a tab in headless Chrome
 python test/run_view.py --mode blame --stream 0 --stream-stop 1   # a half-read view
+python test/run_viewer_stream.py    # the full-tab viewer's live handover
 ```
 
 `run_harness.py --summary` aggregates the whole corpus and then names only the
 cases that look wrong. Run it after any change to the parsing modules.
+
+`run_viewer_stream.py` is the only check that reaches the full-tab viewer. That
+surface is fed entirely by `chrome.storage.local`, which does not exist outside
+an extension, so nothing offline could touch it — and it shipped once with a
+handover that opened, rendered a snapshot, and never updated again. The harness
+stubs storage in memory and replays a read note by note. Keep `--gap` at or above
+the rebuild throttle: below it every note lands inside one window, the view jumps
+from empty straight to finished, and the harness reports a pass for behaviour
+that is entirely static. `--gap 1` is worth running once as a negative control,
+to confirm the check still fails when it should.
 
 `run_view.py --stream [ms]` replays a fixture the way a live capture arrives —
 visit list first, then notes newest-first on a timer — and `--stream-stop n`
