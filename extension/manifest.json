@@ -29,6 +29,7 @@
         "lib/opd_course.js",
         "lib/opd_stream.js",
         "lib/opd_view.js",
+        "lib/opd_inline.js",
         "lib/capture.js",
         "content.js"
       ],

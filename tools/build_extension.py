@@ -35,6 +35,7 @@ MODULES = [
     "opd_course.js",
     "opd_stream.js",
     "opd_view.js",
+    "opd_inline.js",
     "capture.js",
 ]
 

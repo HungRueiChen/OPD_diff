@@ -18,7 +18,13 @@
  * each note into chrome.storage.local as it lands; the viewer subscribes. See
  * publish() below for why it is one key per note rather than one blob.
  *
- * Everything is mounted inside a SHADOW ROOT. That is not decoration: the HIS
+ * Once a read exists, the note the HIS itself shows is also coloured in place
+ * ("inline blame", src/opd_inline.js). That is the one thing that draws on the
+ * record rather than beside it, so it wraps text without changing any, matches
+ * the note by content rather than by date/clinic/doctor, and can be switched
+ * off from a floating toggle.
+ *
+ * The panel itself is mounted inside a SHADOW ROOT. That is not decoration: the HIS
  * ships its own global CSS (jQuery UI, thickbox, a 2009-era Master.css) and
  * OPDView injects its own stylesheet. Without isolation they bleed into each
  * other in both directions -- and a tool that restyles the medical record it is
@@ -155,6 +161,11 @@
     "  padding:10px 14px;border-radius:20px;border:1px solid #1b4f72;",
     "  background:#1b4f72;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3)}",
     ".btn[disabled]{opacity:.6;cursor:default}",
+    ".pill{position:fixed;right:120px;bottom:16px;z-index:1;",
+    "  font:600 12px/1 system-ui,'Segoe UI','Noto Sans TC',sans-serif;",
+    "  padding:10px 12px;border-radius:20px;border:1px solid #1b4f72;",
+    "  background:#fff;color:#1b4f72;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.2)}",
+    ".pill[aria-pressed=true]{background:#eaf2f8}",
     ".panel{position:fixed;inset:24px;z-index:2;display:flex;flex-direction:column;",
     "  background:#fff;border:1px solid #d7dde3;border-radius:10px;overflow:hidden;",
     "  box-shadow:0 8px 40px rgba(0,0,0,.35);",
@@ -185,6 +196,108 @@
   button.className = "btn";
   button.textContent = "OPD_diff";
   shadow.appendChild(button);
+
+  // ---------------------------------------------------------- inline blame
+  //
+  // Colours the note the HIS itself is showing (in its #opddetail box) by the
+  // visit that first wrote each line; see src/opd_inline.js for the rules that
+  // govern drawing on the record. What this part adds:
+  //
+  //   * It only ever uses a read the clinician started, for the patient still
+  //     on screen. Nothing here fetches anything.
+  //   * The HIS swaps notes into #opddetail with its own script, so a
+  //   MutationObserver notices each new note. The observer is disconnected
+  //     while we decorate, so our own edits cannot retrigger it.
+  //   * One click turns it off, and that choice is remembered.
+
+  var inlineOn = true;
+  var latestModel = null;
+  var readHistno = null;
+  var modelStamp = 0;
+  var inlineTimer = null;
+  var observer = null;
+
+  var pill = document.createElement("button");
+  pill.className = "pill";
+  pill.hidden = true;
+  shadow.appendChild(pill);
+
+  function inlineActive() {
+    return Boolean(inlineOn && latestModel && readHistno && currentHistno() === readHistno);
+  }
+
+  function refreshPill() {
+    pill.hidden = !(latestModel && readHistno && currentHistno() === readHistno);
+    pill.textContent = "Inline blame: " + (inlineOn ? "on" : "off");
+    pill.setAttribute("aria-pressed", String(inlineOn));
+    pill.title = inlineOn
+      ? "Notes shown by the HIS are coloured by the visit that first wrote each line. Click to turn off."
+      : "Click to colour notes shown by the HIS by the visit that first wrote each line.";
+  }
+
+  function watch() {
+    if (observer) observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  function applyInline() {
+    if (typeof OPDInline === "undefined") return;
+    if (observer) observer.disconnect();
+    try {
+      if (!inlineActive()) {
+        OPDInline.undecorate(document);
+      } else {
+        OPDInline.findNoteFieldsets(document).forEach(function (fs) {
+          if (OPDInline.stampOf(fs) === String(modelStamp)) return;
+          try {
+            OPDInline.decorate(fs, latestModel, { stamp: modelStamp });
+          } catch (e) {
+            // A failure must leave the record exactly as the HIS drew it.
+            console.warn("[OPD_diff] inline blame failed; note left as it was:", e);
+            OPDInline.undecorate(fs);
+          }
+        });
+      }
+    } finally {
+      watch();
+    }
+    refreshPill();
+  }
+
+  function scheduleInline() {
+    if (inlineTimer) return;
+    inlineTimer = setTimeout(function () { inlineTimer = null; applyInline(); }, 60);
+  }
+
+  /* Started on the first read, not at page load: until a clinician asks for a
+   * read there is nothing to draw, and no reason to watch the HIS's DOM. */
+  function ensureObserver() {
+    if (observer || typeof MutationObserver === "undefined") return;
+    observer = new MutationObserver(scheduleInline);
+    watch();
+  }
+
+  function setInlineModel(model, histno) {
+    latestModel = model;
+    readHistno = histno;
+    modelStamp++;
+    ensureObserver();
+    scheduleInline();
+  }
+
+  pill.addEventListener("click", function () {
+    inlineOn = !inlineOn;
+    try { chrome.storage.local.set({ opdInlineBlame: inlineOn }); } catch (e) { /* preference only */ }
+    if (typeof OPDInline !== "undefined") OPDInline.undecorate(document);
+    applyInline();
+  });
+
+  try {
+    chrome.storage.local.get("opdInlineBlame", function (res) {
+      void chrome.runtime.lastError;
+      if (res && res.opdInlineBlame === false) inlineOn = false;
+      refreshPill();
+    });
+  } catch (e) { /* default stays on */ }
 
   var panel = null;
 
@@ -294,6 +407,9 @@
     sessionId = Math.random().toString(36).slice(2, 10);
     liveCapture = null;
     publishing = false;
+    // A new read supersedes the old one: strip its colouring at once rather
+    // than leave a previous read's attribution on the page.
+    setInlineModel(null, histno);
     ui.msg.textContent = "reading visits…";
 
     var view = null;
@@ -313,6 +429,8 @@
       // do if this tore the panel down and mounted again.
       if (view) view.update(data);
       else view = OPDView.mount(ui.mount, data);
+      // The same model colours the HIS's own note, inline, as it arrives.
+      setInlineModel(model, histno);
     }
 
     var stream = OPDStream.create({ onModel: render });

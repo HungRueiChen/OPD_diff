@@ -1,0 +1,200 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPD_diff inline blame harness</title>
+<!--
+  Runs src/opd_inline.js over every de-identified note, the way the HIS shows
+  them: each note's HTML is inserted into a #opddetail box, decorated, checked,
+  and undecorated.
+
+  What is checked, and why:
+    textPreserved   the page's text is identical while decorated (legend boxes
+                    aside). Inline blame may wrap text, never change it.
+    restoreExact    undecorate() returns the markup to exactly what it was.
+    wrongPatient    a note decorated against ANOTHER patient's record must come
+                    back "mismatch" and carry no colour. This is the check that
+                    stands between a doctor and someone else's history.
+    streaming       with only the newest note read, the note is decorated but
+                    every coloured line is grey "untraced" and none claims to be
+                    new; an unread visit reports "not-read".
+
+  Usage:  python test/run_inline.py [--edge] [--show 51,0]
+  ?show=case,note renders that one note decorated and leaves it on screen.
+-->
+<style>
+  body{margin:0;font:13px/1.5 'Segoe UI','Noto Sans TC',sans-serif}
+  #stage{padding:12px;width:835px}
+  #stage td.left{text-align:left}
+  #stage pre{white-space:pre-wrap;margin:0;font:12px/1.6 'Noto Sans TC',monospace}
+  #out{padding:8px;font:12px/1.5 monospace;white-space:pre-wrap}
+</style>
+<div id="stage"><div id="opddetail"></div></div>
+<pre id="out">did not run</pre>
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script src="../src/opd_stream.js"></script>
+<script src="../src/opd_view.js"></script>
+<script src="../src/opd_inline.js"></script>
+<script>
+(function () {
+  "use strict";
+  var out = document.getElementById("out");
+  var box = document.getElementById("opddetail");
+  var params = new URLSearchParams(location.search);
+  var names = Object.keys(window.OPD_FIXTURES || {});
+
+  function visibleText(el) {
+    var clone = el.cloneNode(true);
+    clone.querySelectorAll("[data-opd-blame-legend]").forEach(function (n) { n.remove(); });
+    return clone.textContent;
+  }
+
+  try {
+    if (!names.length) throw new Error("no fixtures -- run tools/make_fixture_js.py");
+
+    // ------------------------------------------------ one note, left on screen
+    var show = params.get("show");
+    if (show) {
+      var sp = show.split(",").map(function (s) { return parseInt(s, 10); });
+      var cap = window.OPD_FIXTURES[names[sp[0]]];
+      var mdl = OPDStream.buildModel(cap);
+      box.innerHTML = cap.notes[sp[1] || 0].html;
+      var fs = OPDInline.findNoteFieldsets(box)[0];
+      var res = OPDInline.decorate(fs, mdl, { stamp: 1 });
+      out.textContent = "INLINE SHOW " + JSON.stringify(res);
+      return;
+    }
+
+    // ------------------------------------------------------ the whole corpus
+    var tally = { notes: 0, decorated: 0, mismatch: 0, notRead: 0, other: 0, noFieldset: 0,
+                  lines: 0, attributed: 0, own: 0, ambiguous: 0 };
+    var failures = [];
+    var models = [];
+
+    names.forEach(function (name, ci) {
+      var capture = window.OPD_FIXTURES[name];
+      var model;
+      try { model = OPDStream.buildModel(capture); }
+      catch (e) { failures.push(name + ": buildModel threw " + e); return; }
+      models.push({ name: name, capture: capture, model: model });
+
+      capture.notes.forEach(function (raw, ni) {
+        box.innerHTML = raw.html;
+        var fs = OPDInline.findNoteFieldsets(box)[0];
+        tally.notes++;
+        if (!fs) { tally.noFieldset++; return; }
+        var beforeHtml = box.innerHTML;
+        var beforeText = box.textContent;
+        var r;
+        try { r = OPDInline.decorate(fs, model, { stamp: 1, debug: true }); }
+        catch (e) { failures.push(name + " note " + ni + ": decorate threw " + (e && e.stack || e)); return; }
+
+        if (r.status === "decorated") tally.decorated++;
+        else if (r.status === "mismatch") tally.mismatch++;
+        else if (r.status === "not-read") tally.notRead++;
+        else tally.other++;
+        if (r.candidates > 1) tally.ambiguous++;
+        tally.lines += r.lines; tally.attributed += r.attributed; tally.own += r.own;
+
+        /* The legend tells the reader that uncoloured lines are HIS boilerplate.
+         * That is a claim, so measure it: every plain line is classed as inside
+         * a TOCC block, a pain-score line, or a duplicate-medication reason --
+         * or as NOT boilerplate, which is what the claim must not hide. */
+        var inTocc = false;
+        (r.plainLines || []).forEach(function (t) {
+          var boiler = false;
+          if (t.indexOf("【TOCC問診資料】") >= 0) inTocc = true;
+          if (inTocc || /【疼痛評估/.test(t) || /重[複覆]用藥理由/.test(t)) boiler = true;
+          if (t.indexOf("【TOCC END】") >= 0) inTocc = false;
+          if (boiler) tally.plainBoilerplate = (tally.plainBoilerplate || 0) + 1;
+          else {
+            tally.plainOther = (tally.plainOther || 0) + 1;
+            if ((tally.plainOtherSamples || (tally.plainOtherSamples = [])).length < 12) {
+              tally.plainOtherSamples.push(t.slice(0, 70));
+            }
+          }
+        });
+
+        if (visibleText(box) !== beforeText) {
+          failures.push(name + " note " + ni + ": TEXT CHANGED while decorated");
+        }
+        OPDInline.undecorate(box);
+        if (box.innerHTML !== beforeHtml) {
+          failures.push(name + " note " + ni + ": undecorate did not restore the markup exactly");
+        }
+      });
+    });
+
+    // ------------------------------------------- another patient's record
+    // Each case's first note, decorated against the NEXT case's record. Nothing
+    // may be coloured. A note whose text happens to be identical to one in the
+    // other record (an empty template) is counted separately, not as a pass.
+    // Pairs are skipped when both captures carry the same patient pseudonym: the
+    // corpus holds one patient captured twice (once in the first session, again
+    // in a ward batch), and colouring that note with that record is CORRECT. The
+    // first run of this check counted it as a failure.
+    var wrong = { tried: 0, refused: 0, coloured: 0, samePatientSkipped: 0 };
+    models.forEach(function (m, i) {
+      var other = models[(i + 1) % models.length];
+      if (other === m || !m.capture.notes.length) return;
+      if (m.capture.histno && m.capture.histno === other.capture.histno) {
+        wrong.samePatientSkipped++;
+        return;
+      }
+      box.innerHTML = m.capture.notes[0].html;
+      var fs = OPDInline.findNoteFieldsets(box)[0];
+      if (!fs) return;
+      wrong.tried++;
+      var r = OPDInline.decorate(fs, other.model, { stamp: 1 });
+      if (r.status === "decorated") {
+        wrong.coloured++;
+        failures.push(m.name + ": COLOURED WITH ANOTHER PATIENT'S RECORD (" + other.name + ")");
+      } else {
+        wrong.refused++;
+      }
+      OPDInline.undecorate(box);
+    });
+
+    // ------------------------------------------------------ a read in flight
+    var streamCase = models.filter(function (m) { return m.capture.notes.length >= 10; })[0];
+    var streamCheck = null;
+    if (streamCase) {
+      var cap2 = streamCase.capture;
+      // The newest note alone, as it is a second after the read starts.
+      var partial = OPDStream.buildModel({ list: cap2.list, notes: cap2.notes.slice(0, 1) });
+      partial.done = false;
+      box.innerHTML = cap2.notes[0].html;
+      var fsA = OPDInline.findNoteFieldsets(box)[0];
+      var a = OPDInline.decorate(fsA, partial, { stamp: 1 });
+      OPDInline.undecorate(box);
+      // An older visit that has not arrived yet.
+      box.innerHTML = cap2.notes[cap2.notes.length - 1].html;
+      var fsB = OPDInline.findNoteFieldsets(box)[0];
+      var b = OPDInline.decorate(fsB, partial, { stamp: 1 });
+      OPDInline.undecorate(box);
+      streamCheck = { "case": streamCase.name, newestNote: a, unreadNote: b.status };
+      if (a.status !== "decorated") failures.push("streaming: newest note not decorated (" + a.status + ")");
+      if (a.own !== 0) failures.push("streaming: " + a.own + " line(s) claimed as new before any ancestor was read");
+      if (a.attributed && a.untraced !== a.attributed) {
+        failures.push("streaming: " + (a.attributed - a.untraced) + " line(s) given a date while untraceable");
+      }
+      if (b.status !== "not-read") failures.push("streaming: unread visit reported " + b.status + ", expected not-read");
+    }
+
+    var report = {
+      version: OPDInline.version,
+      corpus: tally,
+      lineCoverage: tally.lines ? Math.round(tally.attributed / tally.lines * 1000) / 10 + "%" : null,
+      linesNewAtTheirOwnVisit: tally.attributed ? Math.round(tally.own / tally.attributed * 1000) / 10 + "%" : null,
+      wrongPatient: wrong,
+      streaming: streamCheck,
+      failureCount: failures.length,
+      failures: failures.slice(0, 40),
+    };
+    out.textContent = (failures.length ? "INLINE FAIL\n" : "INLINE OK\n") + JSON.stringify(report, null, 2);
+  } catch (e) {
+    out.textContent = "INLINE ERROR\n" + ((e && e.stack) || e);
+  }
+})();
+</script>

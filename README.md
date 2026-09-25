@@ -89,6 +89,33 @@ hint, never as a classification.
 "Open in tab" hands the same view to a full browser tab, which reads better on a
 wide screen.
 
+### Inline blame on the HIS page
+
+Once you have read a patient with the OPD_diff button, the notes the **HIS itself
+shows** are coloured too: open any visit in the HIS's own list and its S, O and P
+lines are washed blue (oldest) through red (newest) by the visit that first wrote
+them. Hover a line for that date and clinic. A small box at the top of the note
+gives the scale and how many lines this visit actually wrote.
+
+This is the only part of OPD_diff that draws on the record rather than beside it,
+so it follows stricter rules:
+
+- **No text is changed.** Lines are only wrapped for colour; switching it off
+  restores the page exactly. Checked across all 2152 corpus notes.
+- **The note is recognised by its content, not by date, clinic and doctor** —
+  a doctor sees many patients in one session, so those are shared across
+  patients. If the note on screen does not match the record that was read, it
+  is left uncoloured and says so. Checked against 69 other patients' records:
+  none coloured.
+- **It is honest while reading.** Until older visits arrive, lines that cannot
+  be traced yet are grey and dashed and claim no date; a visit not read yet
+  says so.
+- Uncoloured lines are almost always HIS boilerplate (the TOCC questionnaire,
+  pain scores) that is stripped before comparing visits.
+
+The **Inline blame: on/off** button beside OPD_diff turns it off, and the choice
+is remembered. Nothing is fetched to do this — it uses the read you already made.
+
 ---
 
 ## For developers
@@ -121,6 +148,7 @@ python test/run_harness.py --summary   # parser/lineage/course over every fixtur
 python test/run_view.py --mode compare # render a tab in headless Chrome
 python test/run_view.py --mode blame --stream 0 --stream-stop 1   # a half-read view
 python test/run_viewer_stream.py    # the full-tab viewer's live handover
+python test/run_inline.py           # inline blame over every corpus note
 ```
 
 `run_harness.py --summary` aggregates the whole corpus and then names only the
