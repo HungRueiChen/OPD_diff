@@ -368,6 +368,14 @@
 
     var fetched = 0;
     for (var i = 0; i < rows.length && fetched < max; i++) {
+      // A caller that no longer wants this read -- the overlay, when a newer
+      // read replaces it -- says so here, and the loop stops before its next
+      // request rather than running on in the background beside the new one.
+      if (typeof options.shouldStop === "function" && options.shouldStop()) {
+        capture.stopped = true;
+        console.log("[OPD_diff] read stopped by the caller after " + fetched + " note(s).");
+        break;
+      }
       var noteUrl = noteUrlForRow(rows[i]);
       if (!noteUrl) {
         capture.errors.push({ rowIndex: i, error: "no usable link in row" });
@@ -594,7 +602,7 @@
 
   window.OPDCapture = { run: run, collect: collect, captureFailed: captureFailed,
                         runBatch: runBatch, stop: stop, normalizeHistno: normalizeHistno,
-                        wardHistnos: wardHistnos, getPage: getPage, version: 6 };
+                        wardHistnos: wardHistnos, getPage: getPage, version: 7 };
   console.log("[OPD_diff] capture.js ready.\n" +
               "  one patient : OPDCapture.run(\"<chart number>\")\n" +
               "  a ward      : OPDCapture.runBatch(OPDCapture.wardHistnos())\n" +

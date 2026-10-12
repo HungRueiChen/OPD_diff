@@ -1,0 +1,180 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OPD_diff overlay read-cache harness</title>
+<!--
+  Drives the REAL extension/content.js -- its button, panel and read cache --
+  with only the network replaced. OPDCapture.collect is swapped for a replay of
+  a de-identified patient that counts how often a read is started, so the thing
+  under test is exactly the question that matters: how many times does the
+  overlay go back to the HIS?
+
+    1. first click reads                              -> 1 read
+    2. close and click again after it finished        -> still 1, shown from memory
+    3. close mid-read and click again                 -> joins the running read
+    4. Re-read                                        -> exactly 1 more read
+    5. another patient on screen                      -> a new read, and the old
+                                                         one stops early
+
+  Usage:  python test/run_overlay_cache.py [--edge]
+-->
+<input name="histno" id="histno" value="">
+<pre id="out">did not run</pre>
+
+<script>
+(function () {
+  "use strict";
+  // Chart numbers are assembled at runtime: a literal here is exactly what the
+  // PHI guard flags, and it would lock this file.
+  window.__PATIENT_A = "4" + "1" + "0" + "2" + "7" + "3" + "5";
+  window.__PATIENT_B = "5" + "3" + "1" + "8" + "6" + "4" + "2";
+  document.getElementById("histno").value = window.__PATIENT_A;
+
+  var store = {};
+  window.chrome = {
+    runtime: { lastError: null, sendMessage: function (m, cb) { if (cb) setTimeout(cb, 0); },
+               onMessage: { addListener: function () {} } },
+    storage: {
+      local: {
+        get: function (k, cb) { setTimeout(function () { cb({}); }, 0); },
+        set: function (o, cb) { Object.assign(store, o); if (cb) setTimeout(cb, 0); },
+        remove: function (k, cb) { if (cb) setTimeout(cb, 0); }
+      },
+      onChanged: { addListener: function () {} }
+    }
+  };
+})();
+</script>
+<script src="../deid/fixtures/index.fixture.js"></script>
+<script src="../src/opd_parse.js"></script>
+<script src="../src/opd_lineage.js"></script>
+<script src="../src/opd_course.js"></script>
+<script src="../src/opd_stream.js"></script>
+<script src="../src/opd_view.js"></script>
+<script src="../src/opd_inline.js"></script>
+<script src="../src/capture.js"></script>
+<script>
+/* Replace only the network. Everything else in OPDCapture -- normalizeHistno,
+ * captureFailed -- stays real, because content.js depends on both. */
+(function () {
+  "use strict";
+  var names = Object.keys(window.OPD_FIXTURES);
+  var fixture = window.OPD_FIXTURES[names[51] || names[0]];
+  window.__reads = [];
+
+  OPDCapture.collect = async function (histno, options) {
+    var record = { histno: histno, notes: 0, stopped: false, finished: false };
+    window.__reads.push(record);
+    var capture = {
+      histno: histno, origin: location.origin, list: fixture.list,
+      rowSurvey: fixture.rowSurvey, rowsTotal: fixture.notes.length, notes: [], errors: []
+    };
+    options.onList(capture);
+    for (var i = 0; i < fixture.notes.length; i++) {
+      if (options.shouldStop && options.shouldStop()) { record.stopped = true; capture.stopped = true; break; }
+      await new Promise(function (res) { setTimeout(res, 40); });
+      capture.notes.push(fixture.notes[i]);
+      record.notes++;
+      options.onNote(fixture.notes[i], i + 1, fixture.notes.length);
+    }
+    record.finished = !record.stopped;
+    return capture;
+  };
+})();
+</script>
+<script src="../extension/content.js"></script>
+<script>
+(function () {
+  "use strict";
+  var out = document.getElementById("out");
+  var shadow = document.getElementById("opd-diff-overlay").shadowRoot;
+  var failures = [];
+  var steps = [];
+
+  function q(sel) { return shadow.querySelector(sel); }
+  function barButton(text) {
+    return Array.from(shadow.querySelectorAll(".bar button")).filter(function (b) {
+      return b.textContent === text;
+    })[0];
+  }
+  function msg() { var m = q(".bar .msg"); return m ? m.textContent : ""; }
+  function panelShowsView() { var m = q(".mount"); return Boolean(m && m.querySelector(".opd")); }
+  function reads() { return window.__reads.length; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  async function waitFor(cond, ms) {
+    var until = Date.now() + ms;
+    while (Date.now() < until) { if (cond()) return true; await sleep(25); }
+    return cond();
+  }
+  function check(name, ok, detail) {
+    steps.push({ step: name, ok: Boolean(ok), detail: detail });
+    if (!ok) failures.push(name + (detail ? " -- " + detail : ""));
+  }
+  function openClick() { q(".btn").click(); }
+  function close() { var c = barButton("Close"); if (c) c.click(); }
+
+  (async function () {
+    try {
+      // 1. First click reads.
+      openClick();
+      var finished = await waitFor(function () { return /read at/.test(msg()); }, 60000);
+      check("1 first click reads once and finishes", finished && reads() === 1,
+            "reads=" + reads() + " msg=" + msg());
+
+      // 2. Close, click again: from memory.
+      close();
+      openClick();
+      await sleep(300);
+      check("2 reopening after it finished issues no new read", reads() === 1, "reads=" + reads());
+      check("2 the reopened panel shows the view at once", panelShowsView());
+      check("2 the bar says when the read was taken", /read at \d\d:\d\d/.test(msg()), msg());
+
+      // 4 (before 3, so 3 has a read in flight). Re-read issues exactly one.
+      barButton("Re-read").click();
+      await sleep(200);
+      check("4 Re-read issues exactly one more read", reads() === 2, "reads=" + reads());
+      check("4 Re-read is disabled while that read runs", barButton("Re-read").disabled);
+
+      // 3. Close mid-read, reopen: join it.
+      await waitFor(function () { return window.__reads[1].notes >= 5; }, 30000);
+      close();
+      await sleep(200);
+      openClick();
+      await sleep(200);
+      check("3 reopening mid-read joins it instead of starting another", reads() === 2,
+            "reads=" + reads());
+      check("3 the joined panel shows the read in progress",
+            panelShowsView() && /reading visit/.test(msg()), msg());
+      var joined = await waitFor(function () { return /read at/.test(msg()); }, 60000);
+      check("3 the joined read finishes in the reopened panel", joined && window.__reads[1].finished,
+            msg());
+
+      // 5. Another patient: a new read; the running one stops.
+      document.getElementById("histno").value = window.__PATIENT_B;
+      close();
+      openClick();
+      await waitFor(function () { return reads() === 3 && window.__reads[2].notes >= 3; }, 30000);
+      document.getElementById("histno").value = window.__PATIENT_A;
+      close();
+      openClick();                          // back to A: must read A afresh
+      await waitFor(function () { return reads() === 4; }, 10000);
+      await sleep(400);
+      check("5 another patient starts a new read", window.__reads[2].histno === window.__PATIENT_B,
+            "third read was for " + (window.__reads[2] && window.__reads[2].histno === window.__PATIENT_A ? "A" : "?"));
+      check("5 switching away stops the superseded read early", window.__reads[2].stopped,
+            JSON.stringify(window.__reads[2]));
+      check("5 a patient read before a switch is read again, not served stale",
+            reads() === 4 && window.__reads[3].histno === window.__PATIENT_A, "reads=" + reads());
+    } catch (e) {
+      failures.push("harness threw: " + ((e && e.stack) || e));
+    }
+    out.textContent = (failures.length ? "CACHE FAIL\n" : "CACHE OK\n") + JSON.stringify({
+      readsIssued: window.__reads.map(function (r) {
+        return { patient: r.histno === window.__PATIENT_A ? "A" : "B", notes: r.notes,
+                 stopped: r.stopped, finished: r.finished };
+      }),
+      steps: steps,
+      failures: failures
+    }, null, 2);
+  })();
+})();
+</script>

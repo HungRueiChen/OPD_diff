@@ -43,6 +43,16 @@ The fetching stays in the HIS tab — the extra tab never issues a request of it
 own, so opening it does not double the load on the server — which means the HIS
 tab has to stay open. Close it and the read stops.
 
+**A patient is read once, then kept in memory** for as long as the HIS page stays
+open. Closing the panel does not stop a read, and clicking OPD_diff again shows
+whatever it has reached — instantly, with no request to the HIS — or joins it if
+it is still running. Only one patient is kept: opening another patient starts a
+new read (the old one stops), and returning to the first reads it again.
+
+What memory cannot show is a note written *after* the read — typically today's
+note, if you opened OPD_diff before writing it. The bar says when the read was
+taken ("49 visit(s) read at 10:42"); press **Re-read** to fetch everything again.
+
 ---
 
 ## Installing on a ward machine
@@ -149,6 +159,7 @@ python test/run_view.py --mode compare # render a tab in headless Chrome
 python test/run_view.py --mode blame --stream 0 --stream-stop 1   # a half-read view
 python test/run_viewer_stream.py    # the full-tab viewer's live handover
 python test/run_inline.py           # inline blame over every corpus note
+python test/run_overlay_cache.py    # the overlay reads once, then serves memory
 ```
 
 `run_harness.py --summary` aggregates the whole corpus and then names only the
@@ -217,4 +228,6 @@ tests.
 - **A patient's chart number may appear hyphenated** (`nnnnnnn-n`, the last digit
   being a check digit). Both forms are accepted and normalised to the same
   patient.
-- **No caching.** Reopening the panel re-reads every visit.
+- **The in-memory read goes stale.** A note written after the read is not in
+  it until you press Re-read. Only the most recent patient is kept, and nothing
+  survives reloading the HIS page.

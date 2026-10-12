@@ -136,7 +136,7 @@
    * visit list goes over on its own so the viewer can draw the whole roster
    * immediately, exactly as this panel does -- including when the tab is opened
    * before a single note has arrived. */
-  function publish(capture, done) {
+  function publish(capture, finished, done) {
     clearPublished(function () {
       var meta = {
         session: sessionId,
@@ -148,7 +148,9 @@
         if (err) return done(err);
         writeNotes(capture.notes, function (err2) {
           if (err2) return done(err2);
-          setLocal({ opdStatus: statusRecord(capture, false) }, done);
+          // A read served from memory is already finished, and the tab must be
+          // told so, or it would say "still reading" about a read that ended.
+          setLocal({ opdStatus: statusRecord(capture, finished) }, done);
         });
       });
     });
@@ -299,10 +301,184 @@
     });
   } catch (e) { /* default stays on */ }
 
+  // ------------------------------------------------------------- the read
+  //
+  // One read per patient, held in memory for as long as this HIS page stays
+  // loaded. The HIS swaps visits and notes into this same page with its own
+  // script, so the page -- and this content script with it -- lives through a
+  // whole consultation. Reading again on every click would spend a minute or two
+  // of paced requests to fetch notes already in hand.
+  //
+  // The read is therefore decoupled from the panel. The panel is only a window
+  // onto it: close it and the read carries on; open it again and it shows
+  // whatever the read has reached, finished or not.
+  //
+  //   same patient, read finished    -> shown from memory, no request at all
+  //   same patient, read running     -> the panel joins it; no second read
+  //   another patient                -> a new read; the old one stops before
+  //                                     its next request
+  //   last read failed or stopped    -> read again
+  //
+  // A read held in memory does NOT see a note written after it was taken --
+  // today's note, typically, if the panel was first opened before the
+  // consultation. So the bar says when the read was taken, and "Re-read" forces
+  // a fresh one.
+
+  var read = null;
   var panel = null;
+  var ui = null;
+  var view = null;
+
+  function clock(date) {
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    return two(date.getHours()) + ":" + two(date.getMinutes());
+  }
+
+  function setMsg(r, text) {
+    r.message = text;
+    if (ui && read === r) ui.msg.textContent = text;
+  }
+
+  function renderPanel() {
+    if (!ui || !read || !read.model || read.failed) return;
+    var model = read.model;
+    var data = {
+      caseName: "chart on screen",
+      visits: model.visits,
+      entries: model.entries,
+      lineage: model.lineage,
+      course: model.course,
+      loaded: model.loaded,
+      total: model.total,
+      done: model.done
+    };
+    // mount() once per panel, update() after: the view keeps the reader's
+    // selection, tab, filters and scroll position across a rebuild.
+    if (view) view.update(data);
+    else view = OPDView.mount(ui.mount, data);
+  }
+
+  function refreshPanel() {
+    if (!ui) return;
+    if (!read) return;
+    ui.msg.textContent = read.message || "";
+    ui.tabBtn.disabled = !(read.capture && !OPDCapture.captureFailed(read.capture) && !read.failed);
+    // Never two reads at once: re-reading waits for the running one to end.
+    ui.rereadBtn.disabled = !(read.done || read.failed);
+    if (read.failed) fail(ui, read.error);
+    else renderPanel();
+  }
+
+  async function startRead(histno) {
+    var r = {
+      histno: histno, stream: null, capture: null, model: null,
+      done: false, failed: false, partial: false, error: null,
+      message: "reading visits…", readAt: null
+    };
+    read = r;
+    view = null;
+    if (ui) ui.mount.textContent = "";
+
+    sessionId = Math.random().toString(36).slice(2, 10);
+    liveCapture = null;
+    publishing = false;
+    // A new read supersedes the old one: strip its colouring at once rather
+    // than leave a previous read's attribution on the page.
+    setInlineModel(null, histno);
+
+    r.stream = OPDStream.create({
+      onModel: function (model) {
+        if (read !== r) return;
+        r.model = model;
+        renderPanel();
+        // The same model colours the HIS's own note, inline, as it arrives.
+        setInlineModel(model, histno);
+      }
+    });
+    refreshPanel();
+
+    var capture;
+    try {
+      capture = await OPDCapture.collect(histno, {
+        shouldStop: function () { return read !== r; },
+        onList: function (cap) {
+          if (read !== r) return;
+          r.capture = cap;
+          liveCapture = cap;
+          if (OPDCapture.captureFailed(cap)) return;
+          r.stream.setList(cap.list.html);
+          refreshPanel();
+        },
+        onNote: function (page, done, total) {
+          if (read !== r) return;
+          setMsg(r, "reading visit " + done + " of " + total + "…");
+          r.stream.addNote(page);
+          if (publishing) {
+            var batch = {};
+            batch[noteKey(page.rowIndex)] = page;
+            batch.opdStatus = statusRecord(liveCapture, false);
+            setLocal(batch);
+          }
+        }
+      });
+    } catch (e) {
+      if (read !== r) return;
+      if (publishing && liveCapture) setLocal({ opdStatus: statusRecord(liveCapture, true) });
+      // Partway through is not nothing. Keep what was read and say where it
+      // stopped -- but mark it partial, so the next click reads again rather
+      // than serving an incomplete record from memory as if it were whole.
+      if (r.model) {
+        r.stream.finish();
+        r.done = true;
+        r.partial = true;
+        setMsg(r, "stopped early: " + String((e && e.message) || e) + " — Re-read to try again");
+      } else {
+        r.failed = true;
+        r.error = "Could not read this patient.\n\n" + String((e && e.message) || e);
+      }
+      refreshPanel();
+      return;
+    }
+    if (read !== r) return;
+
+    if (OPDCapture.captureFailed(capture)) {
+      r.failed = true;
+      r.error = "The server returned no visit-list table.\n\n" +
+        "HTTP " + capture.list.status + ", " + capture.list.byteLength + " bytes. " +
+        "On web9 this usually means the patient was never selected in the " +
+        "session; the capture requests findEmr first, so if you are seeing " +
+        "this the page may have logged out.";
+      refreshPanel();
+      return;
+    }
+    if (!capture.notes.length) {
+      r.failed = true;
+      r.error = "This patient has no outpatient notes to compare.";
+      refreshPanel();
+      return;
+    }
+
+    var model = r.stream.finish();
+    r.done = true;
+    r.readAt = new Date();
+    // Tells the viewer to stop saying "still reading" and settle its colours.
+    if (publishing) setLocal({ opdStatus: statusRecord(capture, true) });
+
+    if (!model.entries.length) {
+      r.failed = true;
+      r.error = "Read " + capture.notes.length + " note(s), but none of them matched a " +
+        "row in the visit list, so there is nothing to line up.";
+    } else {
+      setMsg(r, capture.notes.length + " visit(s) read at " + clock(r.readAt) +
+                " · kept in memory — Re-read for notes written since");
+    }
+    refreshPanel();
+  }
 
   function closePanel() {
     if (panel) { panel.remove(); panel = null; }
+    ui = null;
+    view = null;
     button.style.display = "";
   }
 
@@ -326,7 +502,8 @@
     tabBtn.textContent = "Open in tab";
     tabBtn.disabled = true;
     tabBtn.addEventListener("click", function () {
-      if (!liveCapture) return;
+      if (!liveCapture || !read) return;
+      var r = read;
       tabBtn.disabled = true;
       msg.textContent = "handing over to a new tab…";
       // Set BEFORE publishing, not after. publish() is several asynchronous
@@ -334,7 +511,7 @@
       // otherwise fall between the snapshot and the live feed and reach the tab
       // never. Writing one note twice is harmless; missing one is not.
       publishing = true;
-      publish(liveCapture, function (err) {
+      publish(liveCapture, r.done, function (err) {
         if (err) {
           // Loud, not silent. A failed write here would otherwise leave a tab
           // that simply never fills in, with nothing anywhere saying why.
@@ -345,10 +522,20 @@
         }
         chrome.runtime.sendMessage({ type: "open-viewer" }, function () {
           void chrome.runtime.lastError;
-          msg.textContent = "following in a new tab — keep this tab open.";
+          msg.textContent = r.done ? "opened in a new tab."
+                                   : "following in a new tab — keep this tab open.";
           tabBtn.disabled = false;
         });
       });
+    });
+
+    var rereadBtn = document.createElement("button");
+    rereadBtn.textContent = "Re-read";
+    rereadBtn.disabled = true;
+    rereadBtn.title = "Fetch every visit again, for notes written since this read was taken.";
+    rereadBtn.addEventListener("click", function () {
+      if (!read || !(read.done || read.failed)) return;
+      startRead(read.histno);
     });
 
     var closeBtn = document.createElement("button");
@@ -358,6 +545,7 @@
     bar.appendChild(name);
     bar.appendChild(msg);
     bar.appendChild(tabBtn);
+    bar.appendChild(rereadBtn);
     bar.appendChild(closeBtn);
 
     var mount = document.createElement("div");
@@ -366,142 +554,39 @@
     panel.appendChild(bar);
     panel.appendChild(mount);
     shadow.appendChild(panel);
-    return { msg: msg, mount: mount, tabBtn: tabBtn };
+    ui = { msg: msg, mount: mount, tabBtn: tabBtn, rereadBtn: rereadBtn };
+    return ui;
   }
 
-  function fail(ui, text) {
-    ui.msg.textContent = "";
+  function fail(target, text) {
+    view = null;
+    target.msg.textContent = "";
     var box = document.createElement("div");
     box.className = "err";
     box.textContent = text;
-    ui.mount.textContent = "";
-    ui.mount.appendChild(box);
+    target.mount.textContent = "";
+    target.mount.appendChild(box);
   }
 
-  var loading = false;
-
-  /* One capture at a time. The floating button hides itself while the panel is
-   * open, but the toolbar button can still fire, and starting a second capture
-   * over a running one would double the request rate against a server this
-   * project has been careful not to hammer. */
-  async function load() {
-    if (loading) return;
-    loading = true;
-    try {
-      await loadOnce();
-    } finally {
-      loading = false;
-    }
-  }
-
-  async function loadOnce() {
+  function showPanel() {
     var histno = currentHistno();
-    var ui = openPanel();
+    openPanel();
     if (!histno) {
       fail(ui, "No patient is open on this page.\n\n" +
                "Open a patient's record first -- OPD_diff reads the chart number " +
                "from the page URL or the histno field.");
       return;
     }
-
-    sessionId = Math.random().toString(36).slice(2, 10);
-    liveCapture = null;
-    publishing = false;
-    // A new read supersedes the old one: strip its colouring at once rather
-    // than leave a previous read's attribution on the page.
-    setInlineModel(null, histno);
-    ui.msg.textContent = "reading visits…";
-
-    var view = null;
-    function render(model) {
-      var data = {
-        caseName: "chart on screen",
-        visits: model.visits,
-        entries: model.entries,
-        lineage: model.lineage,
-        course: model.course,
-        loaded: model.loaded,
-        total: model.total,
-        done: model.done
-      };
-      // mount() once, update() after: the view keeps the reader's selection,
-      // tab, filters and scroll position across a rebuild, which it could not
-      // do if this tore the panel down and mounted again.
-      if (view) view.update(data);
-      else view = OPDView.mount(ui.mount, data);
-      // The same model colours the HIS's own note, inline, as it arrives.
-      setInlineModel(model, histno);
-    }
-
-    var stream = OPDStream.create({ onModel: render });
-
-    var capture;
-    try {
-      capture = await OPDCapture.collect(histno, {
-        onList: function (cap) {
-          liveCapture = cap;
-          if (OPDCapture.captureFailed(cap)) return;
-          // Enabled as soon as the roster exists: the viewer draws the same
-          // pending-row list this panel does, so an early click is useful
-          // rather than an empty page.
-          ui.tabBtn.disabled = false;
-          stream.setList(cap.list.html);
-        },
-        onNote: function (page, done, total) {
-          ui.msg.textContent = "reading visit " + done + " of " + total + "…";
-          stream.addNote(page);
-          if (publishing) {
-            var batch = {};
-            batch[noteKey(page.rowIndex)] = page;
-            batch.opdStatus = statusRecord(liveCapture, false);
-            setLocal(batch);
-          }
-        }
-      });
-    } catch (e) {
-      // Partway through is not nothing. If the roster is already on screen,
-      // keep what was read and say where it stopped, rather than replacing
-      // forty visits with an error box.
-      if (publishing && liveCapture) setLocal({ opdStatus: statusRecord(liveCapture, true) });
-      if (view) {
-        stream.finish();
-        ui.msg.textContent = "stopped early: " + String((e && e.message) || e);
-      } else {
-        fail(ui, "Could not read this patient.\n\n" + String((e && e.message) || e));
-      }
-      return;
-    }
-
-    if (OPDCapture.captureFailed(capture)) {
-      fail(ui, "The server returned no visit-list table.\n\n" +
-               "HTTP " + capture.list.status + ", " + capture.list.byteLength + " bytes. " +
-               "On web9 this usually means the patient was never selected in the " +
-               "session; the capture requests findEmr first, so if you are seeing " +
-               "this the page may have logged out.");
-      return;
-    }
-
-    if (!capture.notes.length) {
-      fail(ui, "This patient has no outpatient notes to compare.");
-      return;
-    }
-
-    var model = stream.finish();
-    // Tells the viewer to stop saying "still reading" and settle its colours.
-    if (publishing) setLocal({ opdStatus: statusRecord(capture, true) });
-    ui.msg.textContent = capture.notes.length + " visit(s) read";
-
-    if (!model.entries.length) {
-      fail(ui, "Read " + capture.notes.length + " note(s), but none of them matched a " +
-               "row in the visit list, so there is nothing to line up.");
-    }
+    var reuse = read && read.histno === histno && !read.failed && !read.partial;
+    if (reuse) refreshPanel();
+    else startRead(histno);
   }
 
-  button.addEventListener("click", function () { load(); });
+  button.addEventListener("click", showPanel);
 
   chrome.runtime.onMessage.addListener(function (msg) {
     if (msg && msg.type === "toggle-overlay") {
-      if (panel) closePanel(); else load();
+      if (panel) closePanel(); else showPanel();
     }
   });
 })();
